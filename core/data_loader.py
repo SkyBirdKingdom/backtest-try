@@ -27,6 +27,7 @@ class DataLoader:
     def load_stream(self, start_date: str, end_date: str, contract_filter: List[str] = None) -> Generator[TickEvent, None, None]:
         """
         流式生成 TickEvent，包含严格的数据清洗逻辑。
+        新增：过滤掉距离关闸时间超过 4 小时的数据，对齐实盘 LiveDataProvider 逻辑。
         """
         
         query_sql = """
@@ -60,6 +61,7 @@ class DataLoader:
         
         total_count = 0
         skipped_count = 0
+        skipped_time_window = 0 # 统计因时间窗口被跳过的数据
         
         try:
             with self.engine.connect() as conn:
@@ -80,18 +82,15 @@ class DataLoader:
                         # 1. 解析合约名称
                         match = self.contract_pattern.match(row.contract_name)
                         if not match:
-                            # logger.debug(f"跳过: 合约名格式不符 {row.contract_name}")
                             skipped_count += 1
                             continue
                             
                         c_type_str, date_str, period_str = match.groups()
                         
                         # 2. 校验日期一致性
-                        # contract_name 中的日期必须等于 delivery_start 的日期
                         try:
                             contract_date = datetime.strptime(date_str, "%Y%m%d").date()
                             if row.delivery_start.date() != contract_date:
-                                # logger.warning(f"跳过: 日期不匹配 {row.contract_name} | NameDate: {contract_date} != DelivStart: {row.delivery_start.date()}")
                                 skipped_count += 1
                                 continue
                         except ValueError:
@@ -99,7 +98,6 @@ class DataLoader:
                             continue
 
                         # 3. 校验时长 (Duration)
-                        # PH 必须是 1小时 (3600秒), QH 必须是 15分钟 (900秒)
                         if not row.delivery_end:
                             skipped_count += 1
                             continue
@@ -107,18 +105,26 @@ class DataLoader:
                         duration_seconds = (row.delivery_end - row.delivery_start).total_seconds()
                         
                         if c_type_str == "PH":
-                            if abs(duration_seconds - 3600) > 1: # 允许1秒误差
-                                # logger.warning(f"跳过: PH合约时长不对 {row.contract_name} duration={duration_seconds}")
+                            if abs(duration_seconds - 3600) > 1: 
                                 skipped_count += 1
                                 continue
                         elif c_type_str == "QH":
                             if abs(duration_seconds - 900) > 1:
-                                # logger.warning(f"跳过: QH合约时长不对 {row.contract_name} duration={duration_seconds}")
                                 skipped_count += 1
                                 continue
                         
-                        # 4. 确定合约类型 (用于后续费率计算)
-                        # 优先使用数据库里的 contract_type，如果没有则使用解析出来的 c_type_str
+                        # 4. 【新增】4小时时间窗口校验 (LiveDataProvider 对齐)
+                        # 逻辑：距离关闸时间 > 240 分钟的数据丢弃
+                        # 关闸时间 = delivery_start - 1 hour
+                        gate_closure_time = row.delivery_start - timedelta(hours=1)
+                        minutes_to_close = (gate_closure_time - row.trade_time).total_seconds() / 60.0
+                        
+                        # 如果距离关闸还有 240 分钟以上，说明太早了，实盘还没开始接收数据
+                        if minutes_to_close > 240:
+                            skipped_time_window += 1
+                            continue
+                        
+                        # 5. 确定合约类型
                         final_contract_type = row.contract_type if row.contract_type else c_type_str
 
                         yield TickEvent(
@@ -133,7 +139,8 @@ class DataLoader:
                             trade_id=row.trade_id
                         )
                         
-            logger.info(f"数据流加载完成: 总数 {total_count}, 有效 {total_count - skipped_count}, 跳过 {skipped_count}")
+            logger.info(f"数据流加载完成: 总数 {total_count}, 有效 {total_count - skipped_count - skipped_time_window}")
+            logger.info(f"过滤统计: 格式错误/不匹配 {skipped_count}, 超出4小时窗口 {skipped_time_window}")
 
         except Exception as e:
             logger.error(f"数据读取错误: {e}")
