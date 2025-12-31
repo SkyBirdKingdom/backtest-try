@@ -45,6 +45,9 @@ class TradeSignal:
     std_price: Optional[float] = None     # 记录当时的标准差
     trend_info: str = ""                  # 记录趋势信息 (如 "UP/0.8")
     raw_size: float = 0.0                 # 记录风控调整前的原始计算手数
+    # --- 【新增】拦截记录字段 ---
+    is_valid: bool = True          # 默认为有效，被拦截时设为 False
+    failure_reason: str = ""       # 记录被拦截的具体原因 (如 "趋势拦截", "冷却期")
 
 @dataclass
 class Order:

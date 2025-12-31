@@ -91,7 +91,9 @@ class BacktestEngine:
                 # 【新增】记录信号
                 self.recorder.record_signal(sig)
 
-                self.exchange.submit_order(sig)
+                # 只有有效信号才下单
+                if sig.is_valid:
+                    self.exchange.submit_order(sig)
 
         # 回测结束后的处理
         self._on_backtest_finished()
