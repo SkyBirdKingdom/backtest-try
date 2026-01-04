@@ -18,6 +18,9 @@ def main():
         "max_contract_position_size": 1.0, # 默认值，会被 delivery_rules 覆盖
         "daily_loss_limit": 150.0,
         "transaction_cost": 0.23,
+
+        # 【新增】成交所需等待的 Tick 数 (模拟排队)
+        "execution_wait_trades": 3,
         
         # --- 策略参数 ---
         "strategy_params": {

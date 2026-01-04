@@ -16,8 +16,10 @@ class VirtualExchange:
         self.slippage_enabled = config.get('slippage_enabled', False)
         self.slippage_rate = config.get('slippage', 0.008) 
         self.transaction_cost_rate = config.get('transaction_cost', 0.23) 
-        # 超时撤单时间 (秒)
         self.order_timeout_seconds = 300 
+        
+        # 【新增】成交所需的匹配次数 (默认3)
+        self.execution_wait_trades = config.get('execution_wait_trades', 3)
         
         self.current_time = None
         self.positions: Dict[str, Position] = {}
@@ -29,43 +31,34 @@ class VirtualExchange:
         self.order_history: List[Order] = [] 
 
     def on_tick(self, tick: TickEvent):
-        """
-        事件驱动入口：收到新的行情
-        """
         self.current_time = tick.timestamp
-        
-        # 1. 【新增】检查过期订单
         self._check_order_timeout()
-        
-        # 2. 撮合订单
         self._match_orders(tick)
 
+    def cancel_order(self, client_order_id: str) -> bool:
+        for order in self.active_orders:
+            if order.client_order_id == client_order_id:
+                order.state = "CANCELLED"
+                order.action = "USER_CANCELLED"
+                self.active_orders.remove(order)
+                return True
+        return False
+
     def _check_order_timeout(self):
-        """
-        检查并撤销超时订单 (默认5分钟)
-        """
-        # 遍历副本，因为可能会修改列表
         for order in list(self.active_orders):
             if not self.current_time or not order.timestamp:
                 continue
-                
             time_diff = (self.current_time - order.timestamp).total_seconds()
-            
+            # 注意：强平单不应该被超时撤销，但强平单通常是立刻成交的
             if time_diff > self.order_timeout_seconds:
-                # 标记为已取消
                 order.state = "CANCELLED"
                 order.action = "SYSTEM_TIMEOUT"
-                
-                # 从活动订单列表中移除
                 self.active_orders.remove(order)
-                
-                logger.info(f"订单超时撤单: {order.contract_name} {order.side} {order.quantity}MW @ {order.unit_price} "
-                            f"(挂单时间: {order.timestamp}, 当前: {self.current_time}, 耗时: {time_diff:.1f}s)")
+                logger.info(f"订单超时撤单: {order.contract_name}")
 
     def submit_order(self, signal: TradeSignal) -> bool:
         self._order_id_counter += 1
         internal_order_id = f"BK_ORD_{self._order_id_counter}"
-        
         clean_qty = round(signal.size, 1)
         
         order = Order(
@@ -84,7 +77,8 @@ class VirtualExchange:
             open_strategy=getattr(signal, 'open_strategy', ''),
             portfolio_id="BACKTEST_PORTFOLIO",
             delivery_area_id="16",
-            order_type="LIMIT"
+            order_type="LIMIT",
+            match_wait_count=0 # 初始化计数器
         )
         
         self.active_orders.append(order)
@@ -103,28 +97,62 @@ class VirtualExchange:
         )
     
     def _match_orders(self, tick: TickEvent):
+        """
+        撮合逻辑：
+        1. 检查价格是否满足条件。
+        2. 如果满足，增加 match_wait_count。
+        3. 如果 match_wait_count >= execution_wait_trades (默认3)，则成交。
+        4. 强平单 (strategy='force_close_final') 无视此限制，立即成交。
+        """
+        # 使用副本遍历，因为可能会移除订单
         for order in list(self.active_orders):
             if order.contract_name != tick.contract_name:
                 continue
             
-            is_match = False
-            exec_price = tick.price
+            is_price_match = False
             
+            # 1. 检查价格条件
             if order.side == "BUY":
                 if tick.price <= order.unit_price:
-                    is_match = True
-                    if self.slippage_enabled:
-                        exec_price = tick.price * (1 + self.slippage_rate)
-            
+                    is_price_match = True
             elif order.side == "SELL":
                 if tick.price >= order.unit_price:
-                    is_match = True
-                    if self.slippage_enabled:
-                        exec_price = tick.price * (1 - self.slippage_rate)
+                    is_price_match = True
 
-            if is_match:
-                self._execute_trade(order, exec_price, tick)
-                self.active_orders.remove(order)
+            # 2. 处理匹配逻辑
+            if is_price_match:
+                # 特殊通道：强平单立即成交，不需要排队
+                if order.strategy == "force_close_final":
+                    # 强平单以当前市场价成交，或者加上滑点
+                    exec_price = self._calculate_exec_price(tick.price, order.side)
+                    self._execute_trade(order, exec_price, tick)
+                    self.active_orders.remove(order)
+                    continue
+
+                # 常规订单：增加计数器
+                order.match_wait_count += 1
+                
+                # 3. 检查是否满足成交笔数限制
+                if order.match_wait_count >= self.execution_wait_trades:
+                    exec_price = self._calculate_exec_price(tick.price, order.side)
+                    self._execute_trade(order, exec_price, tick)
+                    self.active_orders.remove(order)
+            else:
+                # 如果价格不匹配，计数器是否重置？
+                # 模拟逻辑：如果价格移走了，你还在订单簿里，但如果价格很久才回来，
+                # 这里的简单模拟通常不需要重置，表示“只要累计有3笔成交在你的价格范围内”就轮到你了。
+                # 如果想要更严苛（价格移走就重排），可以在这里 set match_wait_count = 0
+                pass
+
+    def _calculate_exec_price(self, market_price: float, side: str) -> float:
+        """计算包含滑点的成交价"""
+        if not self.slippage_enabled:
+            return market_price
+            
+        if side == "BUY":
+            return market_price * (1 + self.slippage_rate)
+        else:
+            return market_price * (1 - self.slippage_rate)
 
     def _execute_trade(self, order: Order, price: float, tick: TickEvent):
         self._trade_id_counter += 1
@@ -132,15 +160,12 @@ class VirtualExchange:
         
         contract_type = tick.contract_type
         is_qh = "QH" in contract_type or "QH" in order.contract_name
-        
         fee_rate = (self.transaction_cost_rate / 4.0) if is_qh else self.transaction_cost_rate
         fee = fee_rate * order.quantity
             
         self.capital -= fee
-        
         pnl = self._update_position(order, price, tick, is_qh)
         
-        # 更新订单状态
         order.state = "FILLED"
         order.remaining_quantity = 0.0
         
@@ -164,7 +189,7 @@ class VirtualExchange:
         )
         self.trades.append(trade)
         
-        log_msg = f"成交: {order.contract_name} {order.side} {order.quantity:.1f}MW @ {price:.2f} | Fee: {fee:.4f}"
+        log_msg = f"成交: {order.contract_name} {order.side} {order.quantity:.1f}MW @ {price:.2f} (排队{self.execution_wait_trades}笔) | Fee: {fee:.4f}"
         if abs(pnl) > 0.0001:
             log_msg += f" | Realized PnL: {pnl:.2f}"
         logger.info(log_msg)
@@ -172,7 +197,6 @@ class VirtualExchange:
     def _update_position(self, order: Order, price: float, tick: TickEvent, is_qh: bool) -> float:
         key = order.contract_name 
         size_delta = order.quantity if order.side == "BUY" else -order.quantity
-        
         realized_pnl = 0.0
         
         if key not in self.positions:
@@ -200,17 +224,14 @@ class VirtualExchange:
             
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
             closed_qty = min(abs(old_size), abs(size_delta))
-            
             raw_pnl = 0.0
             if old_size > 0: 
                 raw_pnl = (price - pos.avg_price) * closed_qty
             else: 
                 raw_pnl = (pos.avg_price - price) * closed_qty
             
-            if is_qh:
-                realized_pnl = raw_pnl / 4.0
-            else:
-                realized_pnl = raw_pnl
+            if is_qh: realized_pnl = raw_pnl / 4.0
+            else: realized_pnl = raw_pnl
             
             self.capital += realized_pnl
             pos.size = new_size
@@ -220,7 +241,6 @@ class VirtualExchange:
                 pos.strategy_name = order.strategy
         
         pos.timestamp = self.current_time
-        
         if abs(pos.size) < 0.001:
             if key in self.positions:
                 del self.positions[key]

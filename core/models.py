@@ -71,6 +71,8 @@ class Order:
     # --- 新增 ---
     risk_check_passed: bool = True # 标记是否通过风控
     reject_reason: str = ""        # 如果被拒绝，记录原因
+    # 【新增】撮合等待计数器
+    match_wait_count: int = 0
 
 @dataclass
 class Trade:

@@ -10,7 +10,8 @@ from core.models import TickEvent
 from core.recorder import BacktestRecorder
 
 from strategies.pure_strategy import PureStrategyEngine
-from strategies.pure_force_close import PureForceClose
+# 【修改】使用新的平仓管理器，不再使用 pure_force_close
+from strategies.pure_exit_manager import PureExitManager
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,9 +31,10 @@ class BacktestEngine:
         
         # 3. 初始化策略
         self.strategy = PureStrategyEngine(config)
-        self.force_close = PureForceClose(config)
+        # 【修改】初始化 ExitManager
+        self.exit_manager = PureExitManager(config)
         
-        # 4. 内存数据库：存储每个合约的历史 K 线
+        # 4. 内存数据库
         self.bars_memory: Dict[str, List[dict]] = defaultdict(list)
         
     def run(self, start_date: str, end_date: str, contract_filter: List[str] = None):
@@ -49,41 +51,29 @@ class BacktestEngine:
             if tick_count % 50000 == 0:
                 logger.info(f"进度: {tick.timestamp} | 已处理 Tick: {tick_count} | 当前资金: {self.exchange.capital:.2f}")
 
-            # 1. 交易所层：更新时间，检查超时订单，撮合
+            # 1. 交易所层
             self.exchange.on_tick(tick)
             
-            # 2. 数据层：生成K线
-            # 注意：这里的 new_bar 只有在分钟结束时才会生成
+            # 2. 数据层
             new_bar = self.bar_generator.update_tick(tick)
             if new_bar:
                 self.bars_memory[tick.contract_name].append(new_bar)
-                # 保持内存不过大，只保留最近 500 根
                 if len(self.bars_memory[tick.contract_name]) > 500:
                     self.bars_memory[tick.contract_name].pop(0)
 
-            # 3. 策略层：信号计算
-            # 【关键】：这里必须在 if new_bar 之外，确保每个 Tick 都触发计算
-            # 实盘逻辑：收到 Tick -> 更新 Tick 历史 -> 用当前 Tick 价格对比历史 K 线均值 -> 触发信号
-            
-            current_pos = self.exchange.positions.get(tick.contract_name)
-            current_size = current_pos.size if current_pos else 0.0
-            
-            # A. 强制平仓 (Priority 1)
-            should_force_close = self.force_close.check_force_close(
-                tick, current_size, tick.timestamp
+            # 3. 策略层：执行平仓管理 (优先级最高)
+            # 【新增】调用平仓管理器处理止盈、止损、强平
+            self.exit_manager.process(
+                tick, 
+                self.exchange.positions, 
+                self.exchange.active_orders,
+                self.exchange
             )
             
-            if should_force_close:
-                fc_signal = self.force_close.generate_close_signal(tick, current_size, tick.timestamp)
-                self.exchange.submit_order(fc_signal)
-                continue 
-            
-            # B. 开仓策略 (Priority 2)
+            # 4. 策略层：开仓信号计算
             account_info = self.exchange.get_account_info()
             current_daily_pnl = account_info.total_pnl 
             
-            # 获取历史 K 线 (注意：这里取到的是截止上一分钟的完整 K 线)
-            # 策略内部会将当前 Tick 价格与这些历史 K 线的统计值(均值/方差)进行比较
             bars_history = self.bars_memory.get(tick.contract_name, [])
             
             signals = self.strategy.calculate_signals(
@@ -95,10 +85,7 @@ class BacktestEngine:
             )
             
             for sig in signals:
-                # 记录所有生成的信号 (含被拦截的)
                 self.recorder.record_signal(sig)
-
-                # 只有有效信号才下单
                 if sig.is_valid:
                     self.exchange.submit_order(sig)
 
@@ -111,15 +98,9 @@ class BacktestEngine:
         for order in self.exchange.order_history:
             self.recorder.record_order(order)
             
-        # 1. 获取所有交易记录
         trades = self.exchange.trades
-        
-        # 2. 保存到数据库
         self.recorder.save_all(trades)
-        
-        # 3. 打印详细统计 (含单合约盈亏)
         self.recorder.calculate_and_print_stats(trades)
         
-        # 4. 打印最终资金
         logger.info(f"最终资金: {self.exchange.capital:.2f}")
         logger.info(f"本次回测 Run ID: {self.recorder.run_id}")
