@@ -18,8 +18,11 @@ class VirtualExchange:
         self.transaction_cost_rate = config.get('transaction_cost', 0.23) 
         self.order_timeout_seconds = 300 
         
-        # 【新增】成交所需的匹配次数 (默认3)
+        # --- 核心撮合限制 ---
+        # 1. 成交所需的匹配次数 (模拟排队深度)
         self.execution_wait_trades = config.get('execution_wait_trades', 3)
+        # 2. 订单提交延迟秒数 (模拟数据延迟/网络耗时)
+        self.order_submission_delay = config.get('order_submission_delay', 30)
         
         self.current_time = None
         self.positions: Dict[str, Position] = {}
@@ -48,13 +51,16 @@ class VirtualExchange:
         for order in list(self.active_orders):
             if not self.current_time or not order.timestamp:
                 continue
+            # 只有非部分成交的订单才检查超时？
+            # 或者部分成交后，剩余部分也应该有超时限制？
+            # 按照实盘逻辑，通常是订单挂出后多久没“完全成交”就撤。
+            # 这里保持原逻辑：针对整个订单的时间检查。
             time_diff = (self.current_time - order.timestamp).total_seconds()
-            # 注意：强平单不应该被超时撤销，但强平单通常是立刻成交的
             if time_diff > self.order_timeout_seconds:
                 order.state = "CANCELLED"
                 order.action = "SYSTEM_TIMEOUT"
                 self.active_orders.remove(order)
-                logger.info(f"订单超时撤单: {order.contract_name}")
+                logger.info(f"订单超时撤单: {order.contract_name}, 剩余: {order.remaining_quantity}")
 
     def submit_order(self, signal: TradeSignal) -> bool:
         self._order_id_counter += 1
@@ -68,7 +74,7 @@ class VirtualExchange:
             contract_name=signal.contract_name,
             side=signal.action.value,
             quantity=clean_qty,
-            remaining_quantity=clean_qty,
+            remaining_quantity=clean_qty, # 初始化剩余量
             unit_price=signal.price,
             state="NEW",
             action="USER_ADDED",
@@ -78,7 +84,7 @@ class VirtualExchange:
             portfolio_id="BACKTEST_PORTFOLIO",
             delivery_area_id="16",
             order_type="LIMIT",
-            match_wait_count=0 # 初始化计数器
+            match_wait_count=0 
         )
         
         self.active_orders.append(order)
@@ -98,20 +104,20 @@ class VirtualExchange:
     
     def _match_orders(self, tick: TickEvent):
         """
-        撮合逻辑：
-        1. 检查价格是否满足条件。
-        2. 如果满足，增加 match_wait_count。
-        3. 如果 match_wait_count >= execution_wait_trades (默认3)，则成交。
-        4. 强平单 (strategy='force_close_final') 无视此限制，立即成交。
+        撮合逻辑 (含延迟 + 排队 + 流动性限制)
         """
-        # 使用副本遍历，因为可能会移除订单
         for order in list(self.active_orders):
             if order.contract_name != tick.contract_name:
                 continue
             
+            # --- 1. 延迟模拟 ---
+            time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
+            if time_since_creation < self.order_submission_delay:
+                continue
+
             is_price_match = False
             
-            # 1. 检查价格条件
+            # 2. 价格条件检查
             if order.side == "BUY":
                 if tick.price <= order.unit_price:
                     is_price_match = True
@@ -119,56 +125,78 @@ class VirtualExchange:
                 if tick.price >= order.unit_price:
                     is_price_match = True
 
-            # 2. 处理匹配逻辑
+            # 3. 撮合处理
             if is_price_match:
-                # 特殊通道：强平单立即成交，不需要排队
+                # A. 强平单：无视排队，无视流动性(假设必定成交)，立即全额成交
                 if order.strategy == "force_close_final":
-                    # 强平单以当前市场价成交，或者加上滑点
                     exec_price = self._calculate_exec_price(tick.price, order.side)
-                    self._execute_trade(order, exec_price, tick)
+                    # 强平全额成交
+                    self._execute_trade(order, order.remaining_quantity, exec_price, tick)
                     self.active_orders.remove(order)
                     continue
 
-                # 常规订单：增加计数器
+                # B. 常规订单：增加排队计数器
                 order.match_wait_count += 1
                 
-                # 3. 检查是否满足成交笔数限制
+                # 检查是否满足排队次数
                 if order.match_wait_count >= self.execution_wait_trades:
-                    exec_price = self._calculate_exec_price(tick.price, order.side)
-                    self._execute_trade(order, exec_price, tick)
-                    self.active_orders.remove(order)
-            else:
-                # 如果价格不匹配，计数器是否重置？
-                # 模拟逻辑：如果价格移走了，你还在订单簿里，但如果价格很久才回来，
-                # 这里的简单模拟通常不需要重置，表示“只要累计有3笔成交在你的价格范围内”就轮到你了。
-                # 如果想要更严苛（价格移走就重排），可以在这里 set match_wait_count = 0
-                pass
+                    # --- 4. 流动性检查 (Liquidity Check) ---
+                    # 能够成交的数量 = min(订单剩余, 当前Tick成交量)
+                    # 如果 Tick 没有量 (0 volume)，则无法成交
+                    
+                    available_volume = tick.volume if tick.volume > 0 else 0.0
+                    fill_qty = min(order.remaining_quantity, available_volume)
+                    
+                    if fill_qty > 0.001: # 只有量足够才成交
+                        exec_price = self._calculate_exec_price(tick.price, order.side)
+                        
+                        # 执行部分或全部成交
+                        self._execute_trade(order, fill_qty, exec_price, tick)
+                        
+                        # 检查是否完全成交
+                        if order.remaining_quantity <= 0.001:
+                            self.active_orders.remove(order)
+                        else:
+                            # 留在列表中，状态更新为部分成交
+                            order.state = "PARTIALLY_FILLED"
+                            # logger.info(f"部分成交: {order.contract_name} 剩余 {order.remaining_quantity:.1f}")
 
     def _calculate_exec_price(self, market_price: float, side: str) -> float:
-        """计算包含滑点的成交价"""
         if not self.slippage_enabled:
             return market_price
-            
         if side == "BUY":
             return market_price * (1 + self.slippage_rate)
         else:
             return market_price * (1 - self.slippage_rate)
 
-    def _execute_trade(self, order: Order, price: float, tick: TickEvent):
+    def _execute_trade(self, order: Order, execute_quantity: float, price: float, tick: TickEvent):
+        """
+        执行具体的成交逻辑 (支持部分成交)
+        """
         self._trade_id_counter += 1
         trade_id = f"BK_TRD_{self._trade_id_counter}"
         
         contract_type = tick.contract_type
         is_qh = "QH" in contract_type or "QH" in order.contract_name
         fee_rate = (self.transaction_cost_rate / 4.0) if is_qh else self.transaction_cost_rate
-        fee = fee_rate * order.quantity
+        
+        # 计算本次成交的费用
+        fee = fee_rate * execute_quantity
             
         self.capital -= fee
-        pnl = self._update_position(order, price, tick, is_qh)
         
-        order.state = "FILLED"
-        order.remaining_quantity = 0.0
+        # 更新持仓 (返回已实现的 PnL)
+        pnl = self._update_position(order, execute_quantity, price, tick, is_qh)
         
+        # 更新订单剩余量
+        order.remaining_quantity = round(order.remaining_quantity - execute_quantity, 3)
+        
+        if order.remaining_quantity <= 0.001:
+            order.state = "FILLED"
+        else:
+            order.state = "PARTIALLY_FILLED"
+        
+        # 生成成交记录
         trade = Trade(
             timestamp=self.current_time,
             trade_id=trade_id,
@@ -176,7 +204,7 @@ class VirtualExchange:
             contract_name=order.contract_name,
             contract_id=order.contract_id,
             action=order.side,
-            size=order.quantity,
+            size=execute_quantity, # 记录本次实际成交量
             price=price,
             strategy=order.strategy,
             delivery_start=order.delivery_start,
@@ -189,14 +217,19 @@ class VirtualExchange:
         )
         self.trades.append(trade)
         
-        log_msg = f"成交: {order.contract_name} {order.side} {order.quantity:.1f}MW @ {price:.2f} (排队{self.execution_wait_trades}笔) | Fee: {fee:.4f}"
+        log_msg = f"成交: {order.contract_name} {order.side} {execute_quantity:.2f}MW @ {price:.2f} " \
+                  f"(剩余 {order.remaining_quantity:.2f}) | Fee: {fee:.4f}"
         if abs(pnl) > 0.0001:
             log_msg += f" | Realized PnL: {pnl:.2f}"
         logger.info(log_msg)
 
-    def _update_position(self, order: Order, price: float, tick: TickEvent, is_qh: bool) -> float:
+    def _update_position(self, order: Order, quantity: float, price: float, tick: TickEvent, is_qh: bool) -> float:
+        """
+        更新持仓
+        注意：这里的 quantity 是本次成交的数量，不是订单总量
+        """
         key = order.contract_name 
-        size_delta = order.quantity if order.side == "BUY" else -order.quantity
+        size_delta = quantity if order.side == "BUY" else -quantity
         realized_pnl = 0.0
         
         if key not in self.positions:
@@ -213,8 +246,9 @@ class VirtualExchange:
 
         pos = self.positions[key]
         old_size = pos.size
-        new_size = round(old_size + size_delta, 1)
+        new_size = round(old_size + size_delta, 3) # 提高一点精度处理部分成交
         
+        # 1. 开仓 (同向)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
             total_val = abs(old_size) * pos.avg_price + abs(size_delta) * price
             if abs(new_size) > 0:
@@ -222,6 +256,7 @@ class VirtualExchange:
             pos.size = new_size
             pos.strategy_name = order.strategy 
             
+        # 2. 平仓 (反向)
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
             closed_qty = min(abs(old_size), abs(size_delta))
             raw_pnl = 0.0
@@ -236,6 +271,7 @@ class VirtualExchange:
             self.capital += realized_pnl
             pos.size = new_size
             
+            # 如果平仓后反手了 (非常少见，但逻辑上要支持)
             if (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0):
                 pos.avg_price = price
                 pos.strategy_name = order.strategy

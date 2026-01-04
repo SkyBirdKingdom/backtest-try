@@ -19,8 +19,9 @@ def main():
         "daily_loss_limit": 150.0,
         "transaction_cost": 0.23,
 
-        # 【新增】成交所需等待的 Tick 数 (模拟排队)
-        "execution_wait_trades": 3,
+        # --- 回测仿真参数 ---
+        "execution_wait_trades": 1,    # 成交排队等待笔数 (模拟订单簿深度)
+        "order_submission_delay": 30,  # 订单提交延迟秒数 (模拟数据/网络延迟)
         
         # --- 策略参数 ---
         "strategy_params": {
