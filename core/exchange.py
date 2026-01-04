@@ -16,6 +16,8 @@ class VirtualExchange:
         self.slippage_enabled = config.get('slippage_enabled', False)
         self.slippage_rate = config.get('slippage', 0.008) 
         self.transaction_cost_rate = config.get('transaction_cost', 0.23) 
+        # 超时撤单时间 (秒)
+        self.order_timeout_seconds = 300 
         
         self.current_time = None
         self.positions: Dict[str, Position] = {}
@@ -24,17 +26,46 @@ class VirtualExchange:
         
         self._order_id_counter = 0
         self._trade_id_counter = 0
-        self.order_history: List[Order] = [] # 新增历史订单列表
+        self.order_history: List[Order] = [] 
 
     def on_tick(self, tick: TickEvent):
+        """
+        事件驱动入口：收到新的行情
+        """
         self.current_time = tick.timestamp
+        
+        # 1. 【新增】检查过期订单
+        self._check_order_timeout()
+        
+        # 2. 撮合订单
         self._match_orders(tick)
+
+    def _check_order_timeout(self):
+        """
+        检查并撤销超时订单 (默认5分钟)
+        """
+        # 遍历副本，因为可能会修改列表
+        for order in list(self.active_orders):
+            if not self.current_time or not order.timestamp:
+                continue
+                
+            time_diff = (self.current_time - order.timestamp).total_seconds()
+            
+            if time_diff > self.order_timeout_seconds:
+                # 标记为已取消
+                order.state = "CANCELLED"
+                order.action = "SYSTEM_TIMEOUT"
+                
+                # 从活动订单列表中移除
+                self.active_orders.remove(order)
+                
+                logger.info(f"订单超时撤单: {order.contract_name} {order.side} {order.quantity}MW @ {order.unit_price} "
+                            f"(挂单时间: {order.timestamp}, 当前: {self.current_time}, 耗时: {time_diff:.1f}s)")
 
     def submit_order(self, signal: TradeSignal) -> bool:
         self._order_id_counter += 1
         internal_order_id = f"BK_ORD_{self._order_id_counter}"
         
-        # 【关键修改】确保订单数量保留1位小数
         clean_qty = round(signal.size, 1)
         
         order = Order(
@@ -57,7 +88,7 @@ class VirtualExchange:
         )
         
         self.active_orders.append(order)
-        self.order_history.append(order) # 【新增】存入历史
+        self.order_history.append(order)
         return True
 
     def get_positions(self) -> List[Position]:
@@ -109,6 +140,10 @@ class VirtualExchange:
         
         pnl = self._update_position(order, price, tick, is_qh)
         
+        # 更新订单状态
+        order.state = "FILLED"
+        order.remaining_quantity = 0.0
+        
         trade = Trade(
             timestamp=self.current_time,
             trade_id=trade_id,
@@ -129,7 +164,6 @@ class VirtualExchange:
         )
         self.trades.append(trade)
         
-        # 【关键修改】日志中使用 .1f 显示数量，.2f 显示价格
         log_msg = f"成交: {order.contract_name} {order.side} {order.quantity:.1f}MW @ {price:.2f} | Fee: {fee:.4f}"
         if abs(pnl) > 0.0001:
             log_msg += f" | Realized PnL: {pnl:.2f}"
@@ -155,7 +189,6 @@ class VirtualExchange:
 
         pos = self.positions[key]
         old_size = pos.size
-        # 【关键修改】更新持仓时强制保留1位小数，杜绝 0.19999996 这种数
         new_size = round(old_size + size_delta, 1)
         
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
