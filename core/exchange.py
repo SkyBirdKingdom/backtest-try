@@ -4,7 +4,7 @@ from datetime import datetime
 from collections import defaultdict
 from dataclasses import replace
 
-from core.models import Order, Position, Trade, AccountInfo, TradeSignal, TickEvent
+from core.models import Order, Position, Trade, AccountInfo, TradeSignal, TickEvent, SettlementEvent
 
 logger = logging.getLogger("VirtualExchange")
 
@@ -38,11 +38,83 @@ class VirtualExchange:
         self._check_order_timeout()
         self._match_orders(tick)
 
+    # ----------------------------------------------------------------
+    # 【核心修改】交割结算逻辑 (关闸清理)
+    # ----------------------------------------------------------------
+    def settle_expired_positions(self, current_delivery_date: datetime.date) -> List[SettlementEvent]:
+        """
+        清理所有交付日期小于当前日期的持仓和挂单（模拟关闸/交割）
+        """
+        # 1. 找出所有过期的合约名称 (包括有持仓的和有挂单的)
+        expired_contracts = set()
+        settlement_events = []
+        
+        # 检查持仓
+        for contract_name, pos in self.positions.items():
+            if pos.delivery_start.date() < current_delivery_date:
+                expired_contracts.add(contract_name)
+        
+        # 检查挂单
+        for order in self.active_orders:
+            # 只有当 delivery_start 有效时才检查
+            if order.delivery_start and order.delivery_start.date() < current_delivery_date:
+                expired_contracts.add(order.contract_name)
+        
+        if not expired_contracts:
+            return []
+
+        logger.info(f"⚡ 开始结算过期合约 (关闸清理): {len(expired_contracts)} 个合约")
+
+        for contract_name in expired_contracts:
+            # A. 撤销该合约所有未完成的订单
+            # 我们不能直接在遍历 active_orders 时移除，要先收集再处理
+            orders_to_cancel = [o for o in self.active_orders if o.contract_name == contract_name]
+            
+            for order in orders_to_cancel:
+                order.state = "CANCELLED"
+                order.event_sequence_no += 1
+                # 【关键】记录一条系统撤单快照，方便回溯
+                self._log_order_snapshot(order, "SYSTEM_SETTLEMENT_CANCEL")
+                self.active_orders.remove(order)
+            
+            if orders_to_cancel:
+                logger.info(f"  - [{contract_name}] 自动撤单: {len(orders_to_cancel)} 笔")
+
+            # B. 强制平仓/移除持仓
+            if contract_name in self.positions:
+                pos = self.positions.pop(contract_name)
+                
+                # 如果持仓不为0，这是一个异常情况，需要详细记录以便分析
+                if abs(pos.size) > 0.001:
+                    logger.error(
+                        f"⚠️ [异常未平仓] 合约: {contract_name} | "
+                        f"方向: {'多' if pos.size > 0 else '空'} | "
+                        f"数量: {pos.size} MW | "
+                        f"成本价: {pos.avg_price:.2f} | "
+                        f"建仓时间: {pos.initial_entry_time} | "
+                        f"原因分析: 关闸时未能成功平仓，已被强制移除(归零)。"
+                    )
+                    event = SettlementEvent(
+                        timestamp=self.current_time if self.current_time else datetime.now(),
+                        contract_name=contract_name,
+                        contract_id=pos.contract_id,
+                        size=pos.size,
+                        avg_price=pos.avg_price,
+                        reason="EXPIRED_FORCE_CLOSE"
+                    )
+                    settlement_events.append(event)
+                    # 注意：这里我们直接移除了持仓，没有计算最后一笔盈亏(因为没有结算价)
+                    # 资金曲线会维持在最后一次成交的状态。这符合“异常情况”的处理逻辑。
+                else:
+                    logger.info(f"  - [{contract_name}] 正常交割 (持仓已归零)")
+        return settlement_events
+
+    # ----------------------------------------------------------------
+    # 基础功能
+    # ----------------------------------------------------------------
+
     def _log_order_snapshot(self, order: Order, event_action: str = None):
-        """记录快照"""
-        # 创建副本
         snapshot = replace(order)
-        # 更新快照时间为当前时间
         snapshot.timestamp = self.current_time
         if event_action:
             snapshot.action = event_action
@@ -71,12 +143,10 @@ class VirtualExchange:
             delivery_area_id="16",
             order_type="LIMIT",
             match_wait_count=0,
-            # 【新增】初始化序列号为 1
             event_sequence_no=1 
         )
         
         self.active_orders.append(order)
-        # 记录第一条日志
         self._log_order_snapshot(order, "USER_SUBMIT")
         return True
 
@@ -100,7 +170,6 @@ class VirtualExchange:
                     changes.append("QTY")
                 
                 if updated:
-                    # 【新增】序列号 +1
                     order.event_sequence_no += 1
                     action_str = f"USER_MODIFIED_{'_'.join(changes)}"
                     self._log_order_snapshot(order, action_str)
@@ -110,7 +179,6 @@ class VirtualExchange:
     def cancel_order(self, client_order_id: str) -> bool:
         for order in self.active_orders:
             if order.client_order_id == client_order_id:
-                # 【新增】序列号 +1
                 order.event_sequence_no += 1
                 order.state = "CANCELLED"
                 self._log_order_snapshot(order, "USER_CANCELLED")
@@ -124,7 +192,6 @@ class VirtualExchange:
                 continue
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
-                # 【新增】序列号 +1
                 order.event_sequence_no += 1
                 order.state = "CANCELLED"
                 self._log_order_snapshot(order, "SYSTEM_TIMEOUT")
@@ -163,7 +230,6 @@ class VirtualExchange:
                         exec_price = self._calculate_exec_price(tick.price, order.side)
                         self._execute_trade(order, fill_qty, exec_price, tick)
                         
-                        # 检查剩余量，如果已经 FULL_FILLED，则移除
                         if order.remaining_quantity <= 0.001:
                             self.active_orders.remove(order)
 
@@ -173,7 +239,6 @@ class VirtualExchange:
         else: return market_price * (1 - self.slippage_rate)
 
     def _execute_trade(self, order: Order, execute_quantity: float, price: float, tick: TickEvent):
-        """执行成交"""
         self._trade_id_counter += 1
         trade_id = f"BK_TRD_{self._trade_id_counter}"
         
@@ -185,23 +250,18 @@ class VirtualExchange:
         self.capital -= fee
         pnl = self._update_position(order, execute_quantity, price, tick, is_qh)
         
-        # 更新数量
         new_remaining = order.remaining_quantity - execute_quantity
-        
-        # 【新增】序列号 +1 (每次成交都是一个新的事件)
         order.event_sequence_no += 1
         
-        # 严格判断是否完全成交
         if new_remaining <= 0.001:
             order.remaining_quantity = 0.0
-            order.state = "FULL_FILLED"  # 【修正】明确的终态
+            order.state = "FULL_FILLED"
             action_log = "SYSTEM_FILLED"
         else:
             order.remaining_quantity = round(new_remaining, 3)
             order.state = "PARTIALLY_FILLED"
             action_log = "SYSTEM_PARTIAL_FILL"
         
-        # 【关键】记录快照
         self._log_order_snapshot(order, action_log)
         
         trade = Trade(
@@ -231,7 +291,6 @@ class VirtualExchange:
         logger.info(log_msg)
 
     def _update_position(self, order: Order, quantity: float, price: float, tick: TickEvent, is_qh: bool) -> float:
-        # _update_position 保持不变，已在上一轮修正过 initial_entry_time 逻辑
         key = order.contract_name 
         size_delta = quantity if order.side == "BUY" else -quantity
         realized_pnl = 0.0

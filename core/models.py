@@ -117,3 +117,13 @@ class AccountInfo:
     capital: float
     initial_capital: float = 0.0
     total_pnl: float = 0.0
+
+@dataclass
+class SettlementEvent:
+    """【新增】交割/关闸清理事件记录"""
+    timestamp: datetime
+    contract_name: str
+    contract_id: str
+    size: float
+    avg_price: float
+    reason: str

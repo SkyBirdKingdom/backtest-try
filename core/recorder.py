@@ -3,7 +3,7 @@ import logging
 from sqlalchemy import create_engine
 from typing import List
 from datetime import datetime
-from core.models import Trade, TradeSignal, Order
+from core.models import Trade, TradeSignal, Order, SettlementEvent
 
 logger = logging.getLogger("BacktestRecorder")
 
@@ -23,6 +23,24 @@ class BacktestRecorder:
     def record_order(self, order: Order):
         """缓存订单 (在 exchange 中调用)"""
         self.orders_buffer.append(order)
+    
+    def record_settlement(self, event: SettlementEvent):
+        """【新增】记录交割清理事件 (实时写入)"""
+        data = {
+            "timestamp": event.timestamp,
+            "contract_name": event.contract_name,
+            "contract_id": event.contract_id,
+            "size": event.size,
+            "avg_price": event.avg_price,
+            "reason": event.reason,
+            "run_id": self.run_id,
+            "created_at": datetime.now()
+        }
+        try:
+            df = pd.DataFrame([data])
+            df.to_sql("backtest_settlements", self.engine, if_exists="append", index=False)
+        except Exception as e:
+            logger.error(f"写入交割记录失败: {e}")
 
     def save_all(self, trades: List[Trade]):
         """一次性保存所有数据"""

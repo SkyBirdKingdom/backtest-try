@@ -10,7 +10,6 @@ from core.models import TickEvent
 from core.recorder import BacktestRecorder
 
 from strategies.pure_strategy import PureStrategyEngine
-# 【修改】使用新的平仓管理器，不再使用 pure_force_close
 from strategies.pure_exit_manager import PureExitManager
 
 # 配置日志
@@ -31,38 +30,70 @@ class BacktestEngine:
         
         # 3. 初始化策略
         self.strategy = PureStrategyEngine(config)
-        # 【修改】初始化 ExitManager
         self.exit_manager = PureExitManager(config)
         
         # 4. 内存数据库
         self.bars_memory: Dict[str, List[dict]] = defaultdict(list)
         
+        # 5. 交付日盈亏计算状态
+        self.current_delivery_date = None
+        self.current_delivery_pnl = 0.0
+        self.last_processed_trade_count = 0 
+        
+        self.reject_counter = 0 
+
     def run(self, start_date: str, end_date: str, contract_filter: List[str] = None):
-        """
-        运行回测的主循环
-        """
-        logger.info(f"=== 启动回测: {start_date} 至 {end_date} ===")
+        logger.info(f"=== 启动回测 (按交付日排序): {start_date} 至 {end_date} ===")
         
         tick_stream = self.loader.load_stream(start_date, end_date, contract_filter)
         tick_count = 0
         
         for tick in tick_stream:
             tick_count += 1
+            
+            # --- 【核心】交付日变更检测 ---
+            tick_delivery_date = tick.delivery_start.date()
+            
+            if self.current_delivery_date != tick_delivery_date:
+                # 在进入新交付日之前，清理旧的过期持仓！
+                # 这会释放被占用的 position size
+                if self.current_delivery_date is not None:
+                    settlement_events = self.exchange.settle_expired_positions(tick_delivery_date)
+                    for event in settlement_events:
+                        self.recorder.record_settlement(event)
+
+                self.current_delivery_date = tick_delivery_date
+                # 重置交付日累计盈亏
+                self.current_delivery_pnl = 0.0
+                # 通知策略跨日
+                if hasattr(self.strategy, 'on_new_day'):
+                    self.strategy.on_new_day(str(tick_delivery_date))
+                
+                logger.info(f"📅 进入新交付日: {tick_delivery_date} (日内盈亏重置, 过期持仓清理)")
+
             if tick_count % 50000 == 0:
-                logger.info(f"进度: {tick.timestamp} | 已处理 Tick: {tick_count} | 当前资金: {self.exchange.capital:.2f}")
+                logger.info(f"进度: {tick.timestamp} | 交付日: {tick_delivery_date} | 当日PnL: {self.current_delivery_pnl:.2f}")
 
             # 1. 交易所层
             self.exchange.on_tick(tick)
             
-            # 2. 数据层
+            # 2. 实时更新交付日盈亏
+            current_trade_count = len(self.exchange.trades)
+            if current_trade_count > self.last_processed_trade_count:
+                new_trades = self.exchange.trades[self.last_processed_trade_count:]
+                for trade in new_trades:
+                    if trade.delivery_start.date() == self.current_delivery_date:
+                        self.current_delivery_pnl += trade.pnl
+                self.last_processed_trade_count = current_trade_count
+
+            # 3. 数据层
             new_bar = self.bar_generator.update_tick(tick)
             if new_bar:
                 self.bars_memory[tick.contract_name].append(new_bar)
                 if len(self.bars_memory[tick.contract_name]) > 500:
                     self.bars_memory[tick.contract_name].pop(0)
 
-            # 3. 策略层：执行平仓管理 (优先级最高)
-            # 【新增】调用平仓管理器处理止盈、止损、强平
+            # 4. 策略层：执行平仓管理
             self.exit_manager.process(
                 tick, 
                 self.exchange.positions, 
@@ -70,26 +101,30 @@ class BacktestEngine:
                 self.exchange
             )
             
-            # 4. 策略层：开仓信号计算
-            account_info = self.exchange.get_account_info()
-            current_daily_pnl = account_info.total_pnl 
-            
+            # 5. 策略层：开仓信号计算
             bars_history = self.bars_memory.get(tick.contract_name, [])
             
-            signals = self.strategy.calculate_signals(
+            signals = self.strategy.on_tick(
                 tick=tick, 
-                bars=bars_history, 
                 positions=self.exchange.positions, 
-                current_time=tick.timestamp,
-                current_daily_pnl=current_daily_pnl
+                active_orders=self.exchange.active_orders,
+                account_info=None 
             )
             
-            for sig in signals:
-                self.recorder.record_signal(sig)
-                if sig.is_valid:
-                    self.exchange.submit_order(sig)
+            self.strategy.daily_realized_pnl = self.current_delivery_pnl
+            
+            if signals:
+                sig_list = [signals]
+                for sig in sig_list:
+                    self.recorder.record_signal(sig)
+                    if sig.is_valid:
+                        self.exchange.submit_order(sig)
+                    else:
+                        self.reject_counter += 1
+                        if self.reject_counter % 2000 == 0:
+                            logger.info(f"🚫 信号被拒(采样): {sig.contract_name} 原因: [{sig.failure_reason}] DeliveryPnL: {self.current_delivery_pnl:.2f}")
 
-        # 回测结束后的处理
+        # 回测结束
         self._on_backtest_finished()
 
     def _on_backtest_finished(self):

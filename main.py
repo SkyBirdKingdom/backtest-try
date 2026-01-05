@@ -16,7 +16,7 @@ def main():
         "min_price_for_new_position": 10.0, 
         "max_position_size": 15.0,
         "max_contract_position_size": 1.0, # 默认值，会被 delivery_rules 覆盖
-        "daily_loss_limit": 150.0,
+        "daily_loss_limit": 40000.0,
         "transaction_cost": 0.23,
 
         # --- 回测仿真参数 ---
