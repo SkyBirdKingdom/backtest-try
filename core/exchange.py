@@ -2,7 +2,7 @@ import logging
 from typing import List, Dict, Optional
 from datetime import datetime
 from collections import defaultdict
-from dataclasses import replace # 【新增】用于创建对象快照
+from dataclasses import replace
 
 from core.models import Order, Position, Trade, AccountInfo, TradeSignal, TickEvent
 
@@ -16,7 +16,6 @@ class VirtualExchange:
         config = config or {}
         self.slippage_enabled = config.get('slippage_enabled', False)
         self.slippage_rate = config.get('slippage', 0.008) 
-        # 默认手续费 0.23
         self.transaction_cost_rate = config.get('transaction_cost', 0.23) 
         self.order_timeout_seconds = 300 
         
@@ -26,15 +25,12 @@ class VirtualExchange:
         self.current_time = None
         self.positions: Dict[str, Position] = {}
         
-        # 活跃订单：用于撮合，保持原始状态
         self.active_orders: List[Order] = []
-        # 交易记录
         self.trades: List[Trade] = []
         
         self._order_id_counter = 0
         self._trade_id_counter = 0
         
-        # 订单历史：存储所有状态变更的快照 (用于生成流水记录)
         self.order_history: List[Order] = [] 
 
     def on_tick(self, tick: TickEvent):
@@ -42,24 +38,11 @@ class VirtualExchange:
         self._check_order_timeout()
         self._match_orders(tick)
 
-    # ----------------------------------------------------------------
-    # 核心：订单生命周期管理 (含快照记录)
-    # ----------------------------------------------------------------
-
     def _log_order_snapshot(self, order: Order, event_action: str = None):
-        """
-        【关键】创建订单当前状态的快照并存入历史
-        这解决了“没有建仓记录”和“没有修改记录”的问题
-        """
-        # 创建副本
         snapshot = replace(order)
-        # 更新快照的时间为当前发生事件的时间 (便于在DB中排序)
-        # 注意：原 order.timestamp 保持不变，用于计算延迟
         snapshot.timestamp = self.current_time
-        
         if event_action:
             snapshot.action = event_action
-            
         self.order_history.append(snapshot)
 
     def submit_order(self, signal: TradeSignal) -> bool:
@@ -68,7 +51,7 @@ class VirtualExchange:
         clean_qty = round(signal.size, 1)
         
         order = Order(
-            timestamp=self.current_time, # 创建时间
+            timestamp=self.current_time,
             client_order_id=internal_order_id,
             contract_id=signal.contract_id,
             contract_name=signal.contract_name,
@@ -77,7 +60,7 @@ class VirtualExchange:
             remaining_quantity=clean_qty,
             unit_price=signal.price,
             state="NEW",
-            action="USER_SUBMIT", # 标记为提交
+            action="USER_SUBMIT",
             delivery_start=signal.delivery_start,
             strategy=signal.strategy_name,
             open_strategy=getattr(signal, 'open_strategy', ''),
@@ -88,37 +71,29 @@ class VirtualExchange:
         )
         
         self.active_orders.append(order)
-        # 【记录】建仓/挂单快照
         self._log_order_snapshot(order)
         return True
 
     def modify_order(self, client_order_id: str, new_price: Optional[float] = None, new_quantity: Optional[float] = None) -> bool:
-        """
-        修改订单并记录修改历史
-        """
         for order in self.active_orders:
             if order.client_order_id == client_order_id:
                 updated = False
                 changes = []
                 
-                # 修改价格
                 if new_price is not None and abs(order.unit_price - new_price) > 0.001:
                     order.unit_price = new_price
-                    order.match_wait_count = 0 # 价格变动，重新排队
+                    order.match_wait_count = 0 
                     updated = True
                     changes.append("PRICE")
                 
-                # 修改数量
                 if new_quantity is not None and abs(order.remaining_quantity - new_quantity) > 0.001:
-                    order.quantity = new_quantity # 更新总量语义
+                    order.quantity = new_quantity
                     order.remaining_quantity = new_quantity
-                    # 数量变动通常也建议重置排队，或视规则而定。这里统一重置确保严谨。
                     order.match_wait_count = 0 
                     updated = True
                     changes.append("QTY")
                 
                 if updated:
-                    # 【记录】修改快照
                     action_str = f"USER_MODIFIED_{'_'.join(changes)}"
                     self._log_order_snapshot(order, action_str)
                     return True
@@ -128,7 +103,6 @@ class VirtualExchange:
         for order in self.active_orders:
             if order.client_order_id == client_order_id:
                 order.state = "CANCELLED"
-                # 【记录】撤单快照 (在移除前)
                 self._log_order_snapshot(order, "USER_CANCELLED")
                 self.active_orders.remove(order)
                 return True
@@ -141,21 +115,15 @@ class VirtualExchange:
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
                 order.state = "CANCELLED"
-                # 【记录】超时撤单快照
                 self._log_order_snapshot(order, "SYSTEM_TIMEOUT")
                 self.active_orders.remove(order)
                 logger.info(f"订单超时撤单: {order.contract_name}, 剩余: {order.remaining_quantity}")
-
-    # ----------------------------------------------------------------
-    # 撮合与成交
-    # ----------------------------------------------------------------
 
     def _match_orders(self, tick: TickEvent):
         for order in list(self.active_orders):
             if order.contract_name != tick.contract_name:
                 continue
             
-            # 延迟模拟
             time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
             if time_since_creation < self.order_submission_delay:
                 continue
@@ -167,14 +135,12 @@ class VirtualExchange:
                 if tick.price >= order.unit_price: is_price_match = True
 
             if is_price_match:
-                # 强平单
                 if order.strategy == "force_close_final":
                     exec_price = self._calculate_exec_price(tick.price, order.side)
                     self._execute_trade(order, order.remaining_quantity, exec_price, tick)
                     self.active_orders.remove(order)
                     continue
 
-                # 常规排队
                 order.match_wait_count += 1
                 
                 if order.match_wait_count >= self.execution_wait_trades:
@@ -183,17 +149,12 @@ class VirtualExchange:
                     
                     if fill_qty > 0.001: 
                         exec_price = self._calculate_exec_price(tick.price, order.side)
-                        
-                        # 执行成交
                         self._execute_trade(order, fill_qty, exec_price, tick)
                         
                         if order.remaining_quantity <= 0.001:
                             self.active_orders.remove(order)
                         else:
                             order.state = "PARTIALLY_FILLED"
-                            # 部分成交不需要移除，但在 _execute_trade 里已经记录了成交快照吗？
-                            # 实际上成交记录在 trades 表里。orders 表里应该记录状态变更。
-                            # _execute_trade 内部处理了。
 
     def _calculate_exec_price(self, market_price: float, side: str) -> float:
         if not self.slippage_enabled: return market_price
@@ -206,15 +167,12 @@ class VirtualExchange:
         
         contract_type = tick.contract_type
         is_qh = "QH" in contract_type or "QH" in order.contract_name
-        
-        # 手续费计算 (按交易量)
         fee_rate = (self.transaction_cost_rate / 4.0) if is_qh else self.transaction_cost_rate
         fee = fee_rate * execute_quantity
             
         self.capital -= fee
         pnl = self._update_position(order, execute_quantity, price, tick, is_qh)
         
-        # 更新订单状态
         order.remaining_quantity = round(order.remaining_quantity - execute_quantity, 3)
         if order.remaining_quantity <= 0.001:
             order.state = "FILLED"
@@ -223,7 +181,6 @@ class VirtualExchange:
             order.state = "PARTIALLY_FILLED"
             action_log = "SYSTEM_PARTIAL_FILL"
         
-        # 【记录】成交快照 (更新状态后的)
         self._log_order_snapshot(order, action_log)
         
         trade = Trade(
@@ -253,6 +210,13 @@ class VirtualExchange:
         logger.info(log_msg)
 
     def _update_position(self, order: Order, quantity: float, price: float, tick: TickEvent, is_qh: bool) -> float:
+        """
+        更新持仓并维护 initial_entry_time
+        逻辑修正：
+        1. 持仓量绝对值增加（建仓/加仓） -> 更新 initial_entry_time
+        2. 反手（方向改变） -> 更新 initial_entry_time
+        3. 持仓量减少（平仓/部分平仓） -> 不更新
+        """
         key = order.contract_name 
         size_delta = quantity if order.side == "BUY" else -quantity
         realized_pnl = 0.0
@@ -272,17 +236,28 @@ class VirtualExchange:
 
         pos = self.positions[key]
         old_size = pos.size
+        # 更新后的新持仓量
         new_size = round(old_size + size_delta, 3) 
         
+        # 判断交易类型
+        is_increase = abs(new_size) > abs(old_size)
+        is_reversal = (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0)
+        
+        # --- 核心时间更新逻辑 ---
+        if is_reversal or is_increase:
+            pos.initial_entry_time = self.current_time
+        # 如果是部分平仓 (abs(new) < abs(old)) 且没有反手，initial_entry_time 保持不变
+        
+        # 计算 PnL 和更新均价
+        # 1. 开仓/加仓 (同向)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
             total_val = abs(old_size) * pos.avg_price + abs(size_delta) * price
             if abs(new_size) > 0:
                 pos.avg_price = total_val / abs(new_size)
             pos.size = new_size
             pos.strategy_name = order.strategy 
-            # 加仓更新时间
-            pos.initial_entry_time = self.current_time
             
+        # 2. 平仓 (反向)
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
             closed_qty = min(abs(old_size), abs(size_delta))
             raw_pnl = 0.0
@@ -297,10 +272,10 @@ class VirtualExchange:
             self.capital += realized_pnl
             pos.size = new_size
             
-            if (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0):
+            # 如果反手了，更新均价和策略名
+            if is_reversal:
                 pos.avg_price = price
                 pos.strategy_name = order.strategy
-                pos.initial_entry_time = self.current_time
         
         pos.timestamp = self.current_time
         if abs(pos.size) < 0.001:
