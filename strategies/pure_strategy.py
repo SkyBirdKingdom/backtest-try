@@ -4,12 +4,13 @@ import logging
 from typing import List, Dict, Optional, Set, Tuple, Union
 from datetime import datetime, timedelta
 from scipy.stats import linregress 
+from collections import deque
 
-from core.models import TickEvent, TradeSignal, ActionType, Position
+from core.models import TickEvent, TradeSignal, ActionType, Position, Order
 
 logger = logging.getLogger("PureStrategy")
 
-class PureStrategyEngine:
+class PureStrategy:
     def __init__(self, config: dict):
         self.config = config
         self.params = config.get('strategy_params', {})
@@ -30,6 +31,107 @@ class PureStrategyEngine:
         
         self.price_history: Dict[str, List[float]] = {}
         self.delivery_time_strategy_executed: Set[str] = set()
+
+        # --- 【新增】诊断与生命周期管理 ---
+        self.tick_counter = 0
+        self.current_date = None
+        self.daily_realized_pnl = 0.0
+        self.is_risk_triggered = False
+        
+        # --- 【新增】内置Bar合成器 (Tick -> Bar) ---
+        # 你的策略依赖 bars 列表，我们需要在 Tick 回测中实时合成它
+        self.bars: List[dict] = []
+        self.current_bar: Optional[dict] = None
+
+    # ----------------------------------------------------------------
+    # 【新增】生命周期方法 (Engine 调用)
+    # ----------------------------------------------------------------
+    
+    def on_new_day(self, date_str: str):
+        """跨天重置逻辑"""
+        logger.info(f"📅 新的一天: {date_str} (昨日PnL: {self.daily_realized_pnl:.2f})")
+        self.daily_realized_pnl = 0.0
+        self.is_risk_triggered = False
+        self.current_date = date_str
+        # 可选：清空当天的 K 线缓存，防止内存溢出，或者保留用于计算长周期趋势
+        # self.bars = [] 
+
+    def update_pnl(self, pnl: float):
+        """更新策略感知的 PnL"""
+        self.daily_realized_pnl += pnl
+
+    def on_tick(self, tick: TickEvent, positions: Dict[str, Position], active_orders: List[Order], account_info) -> Optional[TradeSignal]:
+        """
+        主入口函数 (适配 BacktestEngine)
+        """
+        self.tick_counter += 1
+        
+        # 1. 自动检测日期变更
+        tick_date = tick.timestamp.strftime("%Y-%m-%d")
+        if self.current_date != tick_date:
+            self.on_new_day(tick_date)
+            
+        # 2. 【核心】实时合成 K 线 (1分钟 Bar)
+        # 你的 _check_trend_analysis 需要 bars 数据
+        self._update_bars(tick)
+
+        # 3. 诊断心跳 (每 10,000 Tick)
+        if self.tick_counter % 10000 == 0:
+            logger.info(f"💓 策略心跳: PnL={self.daily_realized_pnl:.2f}, 风控锁={self.is_risk_triggered}, Bars={len(self.bars)}")
+
+        # 4. 全局日内风控检查
+        if self.is_risk_triggered:
+            return None
+            
+        if self.daily_realized_pnl <= -self.daily_loss_limit:
+            if not self.is_risk_triggered:
+                logger.error(f"💥 触发日内亏损限额! PnL: {self.daily_realized_pnl:.2f} <= -{self.daily_loss_limit}. 停止今日开仓。")
+                self.is_risk_triggered = True
+            return None
+
+        # 5. 调用你原来的逻辑
+        # 注意：Engine 期望返回单个 Signal，而 calculate_signals 返回 List
+        # 我们取第一个有效的
+        signals = self.calculate_signals(tick, self.bars, positions, tick.timestamp, self.daily_realized_pnl)
+        
+        if signals:
+            # 返回优先级最高的信号 (List中的第一个)
+            return signals[0]
+            
+        return None
+
+    def _update_bars(self, tick: TickEvent):
+        """简易的 K 线合成器 (1分钟)"""
+        # 如果是新的分钟，归档旧 Bar
+        if self.current_bar and tick.timestamp.minute != self.current_bar['start_time'].minute:
+            self.bars.append(self.current_bar)
+            # 保持 Bars 长度在合理范围 (例如只保留最近 300 根用于趋势计算)
+            if len(self.bars) > 300:
+                self.bars.pop(0)
+            self.current_bar = None
+            
+        # 更新或创建当前 Bar
+        if not self.current_bar:
+            self.current_bar = {
+                'start_time': tick.timestamp,
+                'open': tick.price,
+                'high': tick.price,
+                'low': tick.price,
+                'close': tick.price,
+                'avg_price': tick.price, # 暂用 Close 代替 VWAP
+                'volume': tick.volume
+            }
+        else:
+            self.current_bar['high'] = max(self.current_bar['high'], tick.price)
+            self.current_bar['low'] = min(self.current_bar['low'], tick.price)
+            self.current_bar['close'] = tick.price
+            self.current_bar['volume'] += tick.volume
+            # 简单平均价更新 (非严格 VWAP，但足够回测用)
+            self.current_bar['avg_price'] = (self.current_bar['avg_price'] + tick.price) / 2
+
+    # ----------------------------------------------------------------
+    # 以下是你原来的业务逻辑 (保持不变)
+    # ----------------------------------------------------------------
 
     def calculate_signals(self, 
                           tick: TickEvent, 
@@ -87,7 +189,7 @@ class PureStrategyEngine:
                 signal.failure_reason = f"Price Limit: {abs(tick.price):.2f} < {self.min_price_for_new_position}"
                 return
 
-        # 1. 冷却期检查 (新增位置：还原实盘的先生成后检查逻辑)
+        # 1. 冷却期检查
         if not self._check_cooldown(signal, current_time):
             signal.is_valid = False
             signal.failure_reason = "Signal Cooldown Active"
@@ -101,10 +203,9 @@ class PureStrategyEngine:
                     signal.failure_reason = "Trend Analysis Failed"
                 return
 
-        # 3. 通用信号验证 (价差、近期持仓)
+        # 3. 通用信号验证
         if not self._validate_signal(signal, positions):
             signal.is_valid = False
-            # reason 已在内部设置
             return
 
         # 4. 日亏损限制
@@ -120,19 +221,13 @@ class PureStrategyEngine:
                 signal.failure_reason = "Too Close to Gate Closure"
                 return
         
-        # 6. 如果所有检查都通过，更新冷却时间
+        # 6. 更新冷却时间
         if signal.is_valid:
             self.last_trade_times[tick.contract_name + signal.strategy_name] = current_time
 
     def _check_cooldown(self, signal: TradeSignal, current_time: datetime) -> bool:
-        """检查信号冷却期"""
         strategy_name = signal.strategy_name
-        # 获取配置中的冷却时间 (默认300秒)
         cooldown = self.params.get('signal_cooldown_seconds', 300)
-        # 如果策略配置有覆盖，尝试获取覆盖值 (简化处理，直接取params)
-        # 注意：calculate_signals 里已经merge了 params，所以这里的 self.params 可能不是最新的
-        # 为了准确，我们在 _check_mean_reversion 等内部已经获取了正确的 params
-        # 但这里难以传递。折衷方案：再次获取基础 cooldown。
         
         key = signal.contract_name + strategy_name
         last_time = self.last_trade_times.get(key)
@@ -149,11 +244,13 @@ class PureStrategyEngine:
         if len(self.price_history[contract]) > 100:
             self.price_history[contract].pop(0)
 
-    # ... (Trend Analysis 保持不变) ...
     def _check_trend_analysis(self, signal: TradeSignal, bars: List[dict]) -> bool:
         if signal.strategy_name not in ["super_mean_reversion_buy", "optimized_extreme_sell"]:
             return True
         cutoff_time = signal.timestamp - timedelta(minutes=30)
+        # 确保 bars 不为空
+        if not bars: return False
+        
         potential_bars = bars[-10:]
         valid_bars = [b for b in potential_bars if b['start_time'] >= cutoff_time]
         price_list = [float(b.get('avg_price', b['close'])) for b in valid_bars]
@@ -232,8 +329,6 @@ class PureStrategyEngine:
         confidence = base_confidence * p_adjustment * data_adjustment
         return min(max(confidence, 0.0), 1.0)
 
-    # ... (_validate_signal, _get_delivery_rule_config, _calculate_action_and_size, _check_time_to_close 保持不变) ...
-    
     def _validate_signal(self, signal: TradeSignal, positions: Dict[str, Position]) -> bool:
         existing_position = positions.get(signal.contract_name)
         if existing_position and abs(existing_position.size) > 0.001:
@@ -309,15 +404,10 @@ class PureStrategyEngine:
         
         window = params.get('ma_window', 20)
         threshold = params.get('threshold', 2.0)
-        # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面检查
         std_ratio = params.get('std_ratio_threshold', 0.05)
         
         if len(bars) < params.get('history_min_len', 5): return None
         
-        # 【修改】不再在此处拦截冷却期
-        # last = self.last_trade_times.get(tick.contract_name + strategy_name)
-        # if last and (now - last).total_seconds() < cooldown: return None
-
         prices = [float(b.get('avg_price', b['close'])) for b in bars[-window:]]
         if not prices: return None
         
@@ -331,12 +421,8 @@ class PureStrategyEngine:
         
         if z_score <= -threshold:
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
-            # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
-            
-            # 【修改】不再在此处更新 last_trade_times，移到外部
-            # if is_valid: self.last_trade_times[tick.contract_name + strategy_name] = now
             
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
@@ -349,14 +435,9 @@ class PureStrategyEngine:
         
         window = params.get('percentile_window', 20)
         percentile = params.get('percentile_high', 95)
-        # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面
         threshold = params.get('threshold', 1.2)
         
         if len(bars) < params.get('history_min_len', 5): return None
-        
-        # 【修改】不再在此处拦截冷却期
-        # last = self.last_trade_times.get(tick.contract_name + strategy_name)
-        # if last and (now - last).total_seconds() < cooldown: return None
         
         prices = [float(b.get('avg_price', b['close'])) for b in bars[-window:]]
         if not prices: return None
@@ -376,14 +457,11 @@ class PureStrategyEngine:
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             
-            # 【修改】不再在此处更新 last_trade_times
-            
             adj_price = max(tick.price * 0.98, mean * 1.2)
             
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Upper{percentile}:{round(upper,2)}", raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
 
-    # ... (_high_volatility_dip_buy, _delivery_time_buy_strategy 保持不变) ...
     def _high_volatility_dip_buy(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
         strategy_name = "high_volatility_dip_buy"
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
