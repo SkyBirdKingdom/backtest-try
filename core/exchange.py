@@ -207,11 +207,17 @@ class VirtualExchange:
             if time_since_creation < self.order_submission_delay:
                 continue
 
+            # 【核心修改】如果是强平单，无视价格限制，强制成交 (Market Order)
+            is_force_close = (order.strategy == "force_close_final")
             is_price_match = False
-            if order.side == "BUY":
-                if tick.price <= order.unit_price: is_price_match = True
-            elif order.side == "SELL":
-                if tick.price >= order.unit_price: is_price_match = True
+
+            if is_force_close:
+                is_price_match = True # 强平单始终匹配
+            else:
+                if order.side == "BUY":
+                    if tick.price <= order.unit_price: is_price_match = True
+                elif order.side == "SELL":
+                    if tick.price >= order.unit_price: is_price_match = True
 
             if is_price_match:
                 if order.strategy == "force_close_final":
