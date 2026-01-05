@@ -8,9 +8,10 @@ logger = logging.getLogger("PureExitManager")
 
 class PureExitManager:
     """
-    纯净版平仓管理器 (Lifecycle Manager) - 增强版 V2.1
-    1. 使用 initial_entry_time 锚定止盈计算
+    纯净版平仓管理器 (Lifecycle Manager) - 增强版 V2.2
+    1. 锚定 initial_entry_time 进行动态止盈计算
     2. 使用 modify_order 进行订单同步
+    3. 【修正】目标价格计算时，手续费Buffer固定为 0.46 (2*0.23)，不区分QH/PH
     """
     def __init__(self, config: dict):
         self.config = config
@@ -71,9 +72,13 @@ class PureExitManager:
         计算目标平仓价格
         """
         entry_price = position.avg_price
-        is_qh = "QH" in tick.contract_type or "QH" in tick.contract_name
-        fee_rate = (self.transaction_cost / 4.0) if is_qh else self.transaction_cost
-        cost_padding = 2 * fee_rate
+        
+        # 【关键修正】
+        # 无论 QH 还是 PH，单位价格必须覆盖单位手续费。
+        # 0.23 是单边单位手续费，双边为 0.46。
+        # 只有在计算最终账户总盈亏(PnL)时，QH才需要除以4，而在定价(Price)时不需要。
+        fee_rate = self.transaction_cost # 固定 0.23
+        cost_padding = 2 * fee_rate      # 固定 0.46
         
         is_long = position.size > 0
         target_price = tick.price
@@ -81,8 +86,7 @@ class PureExitManager:
 
         # --- 阶段 1: 止盈阶段 ---
         if 20 < minutes_to_close <= 240:
-            # 【关键逻辑】使用 initial_entry_time 计算衰减进度
-            # 这样即使部分成交，时间锚点也不会变，止盈线平滑下降
+            # 使用初始建仓时间计算进度
             start_time = position.initial_entry_time if position.initial_entry_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
@@ -105,6 +109,7 @@ class PureExitManager:
 
         # --- 阶段 2: 保本阶段 ---
         elif 10 < minutes_to_close <= 20:
+            # 保本价 = 成本 +/- 0.46
             breakeven_price = (entry_price + cost_padding) if is_long else (entry_price - cost_padding)
             if is_long: target_price = max(breakeven_price, tick.price)
             else: target_price = min(breakeven_price, tick.price)
@@ -161,7 +166,7 @@ class PureExitManager:
         if qty_mismatch:
             new_qty = abs(position.size)
             if existing_order:
-                # 【修改】使用 modify_order 更新数量和最新价格
+                # 使用 modify_order 更新数量和最新价格
                 if exchange.modify_order(existing_order.client_order_id, new_price=target_price, new_quantity=new_qty):
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"同步平仓单 (修改): {tick.contract_name} 数量->{new_qty}, 价格->{target_price}")
@@ -174,7 +179,7 @@ class PureExitManager:
         last_update = self.last_order_update_time.get(tick.contract_name)
         if (not last_update) or (now - last_update).total_seconds() >= 60:
             if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
-                # 【修改】使用 modify_order 更新价格
+                # 使用 modify_order 更新价格
                 if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
