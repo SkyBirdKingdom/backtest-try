@@ -20,7 +20,7 @@ def main():
         "transaction_cost": 0.23,
 
         # --- 回测仿真参数 ---
-        "execution_wait_trades": 1,    # 成交排队等待笔数 (模拟订单簿深度)
+        "execution_wait_trades": 0,    # 成交排队等待笔数 (模拟订单簿深度)
         "order_submission_delay": 30,  # 订单提交延迟秒数 (模拟数据/网络延迟)
         
         # --- 策略参数 ---

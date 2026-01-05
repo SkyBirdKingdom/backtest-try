@@ -73,6 +73,9 @@ class Order:
     reject_reason: str = ""        # 如果被拒绝，记录原因
     # 【新增】撮合等待计数器
     match_wait_count: int = 0
+    # 【新增】事件序列号，用于记录订单状态变更的顺序 (1, 2, 3...)
+    # 解决了同一时间戳下多条记录冲突的问题，也方便回溯
+    event_sequence_no: int = 0
 
 @dataclass
 class Trade:
