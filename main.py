@@ -1,14 +1,50 @@
 import sys
 import os
+import logging
+from sqlalchemy import create_engine, text
 
 # 确保能找到 core 和 strategies
 sys.path.append(os.getcwd())
 
 from core.engine import BacktestEngine
 
+def clear_tables_except_trades(db_url: str):
+    """清空除trades表外的所有回测表"""
+    engine = create_engine(db_url)
+    
+    # 定义需要清空的表（除了trades表）
+    tables_to_clear = [
+        'backtest_contract_stats',
+        'backtest_orders',              
+        'backtest_settlements',
+        'backtest_signals',
+        'backtest_trades'
+    ]
+    
+    for table_name in tables_to_clear:
+        try:
+            with engine.connect() as conn:
+                # 检查表是否存在
+                result = conn.execute(text(f"SELECT to_regclass('{table_name}')"))
+                table_exists = result.scalar() is not None
+                
+                if table_exists:
+                    conn.execute(text(f"DELETE FROM {table_name}"))
+                    conn.commit()
+                    print(f"✅ 已清空表: {table_name}")
+                else:
+                    print(f"⚠️ 表不存在，跳过: {table_name}")
+        except Exception as e:
+            print(f"❌ 清空表 {table_name} 时出错: {e}")
+            if 'conn' in locals():
+                conn.rollback()
+    
+    print("📊 数据清理完成")
+
+
 def main():
     # 1. 数据库配置
-    DB_URL = "postgresql://postgres:123456@127.0.0.1:5432/nordpool_db"
+    DB_URL = "postgresql://postgres:123456@192.168.0.179:5432/nordpool_db?client_encoding=utf8"
     
     # 2. 策略配置
     config = {
@@ -21,7 +57,7 @@ def main():
 
         # --- 回测仿真参数 ---
         "execution_wait_trades": 0,    # 成交排队等待笔数 (模拟订单簿深度)
-        "order_submission_delay": 30,  # 订单提交延迟秒数 (模拟数据/网络延迟)
+        "order_submission_delay": 5,  # 订单提交延迟秒数 (模拟数据/网络延迟)
         
         # --- 策略参数 ---
         "strategy_params": {
@@ -30,20 +66,23 @@ def main():
             "price_change_threshold_ratio": 0.1,
             
             "super_mean_reversion_buy": {
-                "ma_window": 5,          # 【关键】原为 20，现改为 5
-                "threshold": 2.0,
-                "history_min_len": 5,    # 新增
-                "std_ratio_threshold": 0.1, # 新增
-                "position_ratio": 0.2,   # 原配置是 0.2
+                "action": "BUY",
+                "history_min_len": 10,
+                "ma_window": 5,
+                "std_ratio_threshold": 0.1,
+                "threshold": 2,
+                "position_ratio": 0.2,
                 "position_split": 3,
                 "min_open_size": 0.1
             },
             
             "optimized_extreme_sell": {
-                "percentile_window": 5,  # 【关键】原为 100，现改为 5
+                "action": "SELL",
+                "history_min_len": 10,
+                "percentile_window": 5,
                 "percentile_high": 95,
                 "percentile_extreme": 99,
-                "threshold": 1.2,
+                "threshold": 1.3,
                 "position_ratio": 0.6,
                 "position_split": 3,
                 "min_open_size": 0.1
@@ -78,11 +117,11 @@ def main():
                             "strategy_params": {
                                 "super_mean_reversion_buy": {
                                     "position_ratio": 0.5,
-                                    "position_split": 2
+                                    "position_split": 1
                                 },
                                 "optimized_extreme_sell": {
                                     "position_ratio": 0.5,
-                                    "position_split": 2
+                                    "position_split": 1
                                 }
                             }
                         }
@@ -92,16 +131,19 @@ def main():
         }
     }
 
-    # 3. 初始化引擎
+    # 3. 清空除 trades 表外的所有表
+    clear_tables_except_trades(DB_URL)
+    
+    # 4. 初始化引擎
     engine = BacktestEngine(config, DB_URL)
 
     # 4. 运行回测
     # 请确保日期范围内你的数据库有数据
-    start_date = "2025-11-01"
-    end_date = "2025-12-29"
+    start_date = "2026-01-01"
+    end_date = "2026-01-13"
     
     # 可选：只回测特定的合约，填 None 则回测所有
-    # contract_filter = ["PH-20240101-01", "PH-20240101-02"] 
+    # contract_filter = ["QH-20260108-39", "QH-20260109-29"] 
     contract_filter = None
 
     try:

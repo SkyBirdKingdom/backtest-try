@@ -135,6 +135,34 @@ class PureExitManager:
 
         return target_price, is_force_market
 
+    def modify_order(self, exchange, positions: Dict[str, Position], tick: TickEvent, active_orders: List[Order]) -> bool:
+        """
+        修改订单的接口占位符
+        实际调用应由 Exchange 实现
+        """
+        position = positions.get(tick.contract_name)
+        if not position or abs(position.size) < 0.001:
+            return
+        now = tick.timestamp
+
+        # 获取属于本管理器的平仓单
+        existing_order = self._find_exit_order(tick.contract_name, active_orders)
+
+        minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
+
+        target_price, is_force_market = self._calculate_target_price(
+            minutes_to_close, position, tick
+        )
+        target_price = round(target_price, 2)
+
+        # 2. 定时调价 (每分钟)
+        last_update = self.last_order_update_time.get(tick.contract_name)
+        if (not last_update) or (now - last_update).total_seconds() >= 60:
+            if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
+                if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
+                    self.last_order_update_time[tick.contract_name] = now
+                    logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
+
     def _manage_exit_order(self, exchange, position: Position, tick: TickEvent, 
                            existing_order: Optional[Order], target_price: float, 
                            is_force_market: bool, minutes_to_close: float,
@@ -179,13 +207,7 @@ class PureExitManager:
                 self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close)
             return
 
-        # 2. 定时调价 (每分钟)
-        last_update = self.last_order_update_time.get(tick.contract_name)
-        if (not last_update) or (now - last_update).total_seconds() >= 60:
-            if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
-                if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
-                    self.last_order_update_time[tick.contract_name] = now
-                    logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
+        
 
     def _submit_new_exit_order(self, exchange, position: Position, tick: TickEvent, target_price: float, minutes_to_close: float):
         action = ActionType.SELL if position.size > 0 else ActionType.BUY

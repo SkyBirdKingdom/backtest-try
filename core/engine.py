@@ -47,8 +47,12 @@ class BacktestEngine:
         
         tick_stream = self.loader.load_stream(start_date, end_date, contract_filter)
         tick_count = 0
+        tick_set = set()
         
         for tick in tick_stream:
+            if tick.trade_id in tick_set:
+                continue
+            tick_set.add(tick.trade_id)
             tick_count += 1
             
             # --- 【核心】交付日变更检测 ---
@@ -73,6 +77,8 @@ class BacktestEngine:
 
             if tick_count % 50000 == 0:
                 logger.info(f"进度: {tick.timestamp} | 交付日: {tick_delivery_date} | 当日PnL: {self.current_delivery_pnl:.2f}")
+
+            self.exit_manager.modify_order(self.exchange, self.exchange.positions, tick, self.exchange.active_orders)
 
             # 1. 交易所层
             self.exchange.on_tick(tick)
@@ -114,15 +120,9 @@ class BacktestEngine:
             self.strategy.daily_realized_pnl = self.current_delivery_pnl
             
             if signals:
-                sig_list = [signals]
-                for sig in sig_list:
+                for sig in signals:
                     self.recorder.record_signal(sig)
-                    if sig.is_valid:
-                        self.exchange.submit_order(sig)
-                    else:
-                        self.reject_counter += 1
-                        if self.reject_counter % 2000 == 0:
-                            logger.info(f"🚫 信号被拒(采样): {sig.contract_name} 原因: [{sig.failure_reason}] DeliveryPnL: {self.current_delivery_pnl:.2f}")
+                    self.exchange.submit_order(sig)
 
         # 回测结束
         self._on_backtest_finished()

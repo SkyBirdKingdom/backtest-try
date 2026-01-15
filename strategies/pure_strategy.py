@@ -97,13 +97,9 @@ class PureStrategyEngine:
         # 5. 调用原有的 calculate_signals
         # 注意：calculate_signals 需要 bars，我们传入刚刚合成的 self.bars
         signals = self.calculate_signals(tick, self.bars, positions, tick.timestamp, self.daily_realized_pnl)
-        
-        if signals:
-            # Engine 期望返回单个 Signal (或 None)
-            # 这里简单取第一个有效信号
-            return signals[0]
+        valid_signals = [s for s in signals if s.is_valid and s.size > 0]
             
-        return None
+        return valid_signals
 
     def _update_bars(self, tick: TickEvent):
         """简易的 K 线合成器 (1分钟)"""
@@ -124,14 +120,16 @@ class PureStrategyEngine:
                 'low': tick.price,
                 'close': tick.price,
                 'avg_price': tick.price, 
-                'volume': tick.volume
+                'volume': tick.volume,
+                'trade_count': 1
             }
         else:
             self.current_bar['high'] = max(self.current_bar['high'], tick.price)
             self.current_bar['low'] = min(self.current_bar['low'], tick.price)
             self.current_bar['close'] = tick.price
             self.current_bar['volume'] += tick.volume
-            self.current_bar['avg_price'] = (self.current_bar['avg_price'] + tick.price) / 2
+            self.current_bar['avg_price'] = (self.current_bar['avg_price'] * self.current_bar['trade_count'] + tick.price) / (self.current_bar['trade_count'] + 1)
+            self.current_bar['trade_count'] += 1
 
     # ----------------------------------------------------------------
     # 以下为您原始的业务逻辑 (calculate_signals 及辅助方法)
@@ -141,6 +139,7 @@ class PureStrategyEngine:
                           tick: TickEvent, 
                           bars: List[dict], 
                           positions: Dict[str, Position], 
+                          active_orders: List[Order],
                           current_time: datetime,
                           current_daily_pnl: float = 0.0) -> List[TradeSignal]:
         
@@ -156,25 +155,25 @@ class PureStrategyEngine:
                 return []
 
         # --- 策略 1: 均值回归 ---
-        sig_mr = self._check_mean_reversion(tick, bars, positions, current_time)
+        sig_mr = self._check_mean_reversion(tick, bars, positions, active_orders, current_time)
         if sig_mr:
             self._apply_risk_checks(sig_mr, tick, bars, positions, current_time, current_daily_pnl)
             signals.append(sig_mr)
 
         # --- 策略 2: 极端价格 ---
-        sig_ext = self._check_extreme_sell(tick, bars, positions, current_time)
+        sig_ext = self._check_extreme_sell(tick, bars, positions, active_orders, current_time)
         if sig_ext:
             self._apply_risk_checks(sig_ext, tick, bars, positions, current_time, current_daily_pnl)
             signals.append(sig_ext)
         
         # --- 策略 3: 高波动 ---
-        sig_vol = self._high_volatility_dip_buy(tick, positions, current_time)
+        sig_vol = self._high_volatility_dip_buy(tick, positions, active_orders, current_time)
         if sig_vol:
             self._apply_risk_checks(sig_vol, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True)
             signals.append(sig_vol)
 
         # --- 策略 4: 交付时间 ---
-        sig_del = self._delivery_time_buy_strategy(tick, positions, current_time)
+        sig_del = self._delivery_time_buy_strategy(tick, positions, active_orders, current_time)
         if sig_del:
             self._apply_risk_checks(sig_del, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True, skip_close_time=True)
             signals.append(sig_del)
@@ -200,12 +199,12 @@ class PureStrategyEngine:
             return
 
         # 2. 趋势过滤
-        if not skip_trend:
-            if not self._check_trend_analysis(signal, bars):
-                signal.is_valid = False
-                if not signal.failure_reason:
-                    signal.failure_reason = "Trend Analysis Failed"
-                return
+        # if not skip_trend:
+        #     if not self._check_trend_analysis(signal, bars):
+        #         signal.is_valid = False
+        #         if not signal.failure_reason:
+        #             signal.failure_reason = "Trend Analysis Failed"
+        #         return
 
         # 3. 通用信号验证
         if not self._validate_signal(signal, positions):
@@ -373,7 +372,7 @@ class PureStrategyEngine:
         except Exception: pass
         return current_max_pos, params_override
 
-    def _calculate_action_and_size(self, contract_name: str, positions: Dict, max_pos: float, params: Dict, action: ActionType) -> float:
+    def _calculate_action_and_size(self, contract_name: str, positions: Dict, active_orders: List[Order], max_pos: float, params: Dict, action: ActionType) -> float:
         ratio = params.get('position_ratio', 0.5)
         split = params.get('position_split', 3)
         min_size = params.get('min_open_size', 0.1)
@@ -381,8 +380,15 @@ class PureStrategyEngine:
         total_holdings = sum(abs(p.size) for p in positions.values())
         global_avail = max(0.0, self.max_position_size - total_holdings)
         pos = positions.get(contract_name)
-        curr_size = abs(pos.size) if pos else 0.0
-        contract_avail = max(0.0, max_pos - curr_size)
+        curr_pos_size = abs(pos.size) if pos else 0.0
+        # 统计该合约正在挂单的数量 (重点！)
+        pending_size = sum(abs(o.remaining_quantity) for o in active_orders if o.contract_name == contract_name)
+        
+        # 统计全局总持仓 + 总挂单
+        total_global = sum(abs(p.size) for p in positions.values()) + sum(abs(o.remaining_quantity) for o in active_orders)
+        
+        contract_avail = max(0.0, max_pos - (curr_pos_size + pending_size))
+        global_avail = max(0.0, self.max_position_size - total_global)
         final = round(min(desired, global_avail, contract_avail), 1)
         return final if final >= min_size else 0.0
 
@@ -398,7 +404,7 @@ class PureStrategyEngine:
             logger.error(f"Error in _check_time_to_close: {e}")
             return True
 
-    def _check_mean_reversion(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
+    def _check_mean_reversion(self, tick: TickEvent, bars: List[dict], positions: Dict, active_orders: List[Order], now: datetime) -> Optional[TradeSignal]:
         strategy_name = "super_mean_reversion_buy"
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
         params = self.params.get(strategy_name, {}).copy()
@@ -423,7 +429,7 @@ class PureStrategyEngine:
         z_score = (tick.price - mean) / std
         
         if z_score <= -threshold:
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
+            size = self._calculate_action_and_size(tick.contract_name, positions, active_orders, max_pos, params, ActionType.BUY)
             # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
@@ -431,7 +437,7 @@ class PureStrategyEngine:
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
 
-    def _check_extreme_sell(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
+    def _check_extreme_sell(self, tick: TickEvent, bars: List[dict], positions: Dict, active_orders: List[Order], now: datetime) -> Optional[TradeSignal]:
         strategy_name = "optimized_extreme_sell"
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
         params = self.params.get(strategy_name, {}).copy()
@@ -440,7 +446,7 @@ class PureStrategyEngine:
         window = params.get('percentile_window', 20)
         percentile = params.get('percentile_high', 95)
         # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面
-        threshold = params.get('threshold', 1.2)
+        threshold = params.get('threshold', 1.3)
         
         if len(bars) < params.get('history_min_len', 5): return None
         
@@ -458,16 +464,16 @@ class PureStrategyEngine:
             condition = tick.price > upper and tick.price > threshold * mean
             
         if condition:
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.SELL)
+            size = self._calculate_action_and_size(tick.contract_name, positions, active_orders, max_pos, params, ActionType.SELL)
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             
-            adj_price = max(tick.price * 0.98, mean * 1.2)
+            adj_price = max(tick.price * 0.98, mean * 1.3)
             
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Upper{percentile}:{round(upper,2)}", raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
 
-    def _high_volatility_dip_buy(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
+    def _high_volatility_dip_buy(self, tick: TickEvent, positions: Dict, active_orders: List[Order], now: datetime) -> Optional[TradeSignal]:
         strategy_name = "high_volatility_dip_buy"
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
         params = self.params.get(strategy_name, {}).copy()
@@ -481,13 +487,13 @@ class PureStrategyEngine:
         min_p = min(recent[-5:])
         
         if vol >= params.get('threshold', 50.0) and tick.price <= min_p:
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
+            size = self._calculate_action_and_size(tick.contract_name, positions, active_orders, max_pos, params, ActionType.BUY)
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=0.7, open_strategy=strategy_name, std_price=round(vol,2), raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
 
-    def _delivery_time_buy_strategy(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
+    def _delivery_time_buy_strategy(self, tick: TickEvent, positions: Dict, active_orders: List[Order], now: datetime) -> Optional[TradeSignal]:
         strategy_name = "delivery_time_buy"
         if tick.contract_name in self.delivery_time_strategy_executed: return None
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
@@ -495,7 +501,7 @@ class PureStrategyEngine:
         params.update(override.get(strategy_name, {}))
         if 'delivery_time_buy' in override:
             self.delivery_time_strategy_executed.add(tick.contract_name)
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
+            size = self._calculate_action_and_size(tick.contract_name, positions, active_orders, max_pos, params, ActionType.BUY)
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=0.7, open_strategy=strategy_name, raw_size=size, is_valid=is_valid, failure_reason=reason)

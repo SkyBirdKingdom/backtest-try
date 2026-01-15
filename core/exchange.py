@@ -188,7 +188,7 @@ class VirtualExchange:
 
     def _check_order_timeout(self):
         for order in list(self.active_orders):
-            if not self.current_time or not order.timestamp:
+            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking":
                 continue
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
@@ -203,9 +203,9 @@ class VirtualExchange:
             if order.contract_name != tick.contract_name:
                 continue
             
-            time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
-            if time_since_creation < self.order_submission_delay:
-                continue
+            # time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
+            # if time_since_creation < self.order_submission_delay:
+            #     continue
 
             # 【核心修改】如果是强平单，无视价格限制，强制成交 (Market Order)
             is_force_close = (order.strategy == "force_close_final")
