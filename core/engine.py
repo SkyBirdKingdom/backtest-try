@@ -107,9 +107,7 @@ class BacktestEngine:
                 self.exchange
             )
             
-            # 5. 策略层：开仓信号计算
-            bars_history = self.bars_memory.get(tick.contract_name, [])
-            
+            # 5. 策略层：生成交易信号
             signals = self.strategy.on_tick(
                 tick=tick, 
                 positions=self.exchange.positions, 

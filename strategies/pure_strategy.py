@@ -33,6 +33,9 @@ class PureStrategyEngine:
         self.price_history: Dict[str, List[float]] = {}
         self.delivery_time_strategy_executed: Set[str] = set()
 
+        # 【新增】记录上一次发出信号的时间 (Key: Contract_Action)
+        self.last_signal_emit_times: Dict[str, datetime] = {}
+
         # --- 【新增】诊断与生命周期管理 ---
         self.tick_counter = 0
         self.current_date = None
@@ -102,7 +105,7 @@ class PureStrategyEngine:
 
         contract_bars = self.bars[tick.contract_name]
         # 5. 调用原有的 calculate_signals
-        signals = self.calculate_signals(tick, contract_bars, positions, tick.timestamp, self.daily_realized_pnl)
+        signals = self.calculate_signals(tick, contract_bars, positions, active_orders, tick.timestamp, self.daily_realized_pnl)
         
         if signals:
             # Engine 期望返回单个 Signal (或 None)
@@ -159,14 +162,13 @@ class PureStrategyEngine:
                           tick: TickEvent, 
                           bars: List[dict], 
                           positions: Dict[str, Position], 
+                          active_orders: List[Order],
                           current_time: datetime,
                           current_daily_pnl: float = 0.0) -> List[TradeSignal]:
         
         self._update_tick_history(tick)
-        signals = []
-
-        # 更新内部 PnL 状态 (从 Engine 传入)
         self.daily_realized_pnl = current_daily_pnl
+        raw_signals = []
 
         # 0. 基础环境检查
         if abs(tick.price) < self.min_price_for_new_position:
@@ -177,27 +179,69 @@ class PureStrategyEngine:
         sig_mr = self._check_mean_reversion(tick, bars, positions, current_time)
         if sig_mr:
             self._apply_risk_checks(sig_mr, tick, bars, positions, current_time, current_daily_pnl)
-            signals.append(sig_mr)
+            raw_signals.append(sig_mr)
 
         # --- 策略 2: 极端价格 ---
         sig_ext = self._check_extreme_sell(tick, bars, positions, current_time)
         if sig_ext:
             self._apply_risk_checks(sig_ext, tick, bars, positions, current_time, current_daily_pnl)
-            signals.append(sig_ext)
+            raw_signals.append(sig_ext)
         
         # --- 策略 3: 高波动 ---
         sig_vol = self._high_volatility_dip_buy(tick, positions, current_time)
         if sig_vol:
             self._apply_risk_checks(sig_vol, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True)
-            signals.append(sig_vol)
+            raw_signals.append(sig_vol)
 
         # --- 策略 4: 交付时间 ---
         sig_del = self._delivery_time_buy_strategy(tick, positions, current_time)
         if sig_del:
             self._apply_risk_checks(sig_del, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True, skip_close_time=True)
-            signals.append(sig_del)
+            raw_signals.append(sig_del)
 
-        return signals
+        # =========================================================
+        # 【新增】生产环境逻辑检查 (信号抑制 + 订单互斥)
+        # =========================================================
+        valid_signals = []
+        for sig in raw_signals:
+            if not sig.is_valid: 
+                continue # 已经被前面的基础风控拦截了
+            
+            # 执行生产环境检查
+            if self._check_production_constraints(sig, active_orders, current_time):
+                valid_signals.append(sig)
+                
+        return valid_signals
+    
+    def _check_production_constraints(self, signal: TradeSignal, active_orders: List[Order], current_time: datetime) -> bool:
+        """
+        生产环境逻辑检查：
+        1. 订单互斥：存在同合约同方向的"活跃开仓单"时，禁止发新单
+        2. 信号抑制：5秒内同合约同方向抑制
+        """
+        # 1. 订单开仓限制
+        for order in active_orders:
+            if order.contract_name == signal.contract_name:
+                if order.side == signal.action.value:
+                    # 排除平仓单 (auto_profit_taking, force_close)
+                    if not (order.strategy.startswith("auto_profit_taking") or order.strategy.startswith("force_close")):
+                        signal.is_valid = False
+                        signal.failure_reason = f"Production Limit: Active Order Exists ({order.client_order_id})"
+                        return False
+
+        # 2. 信号抑制 (5秒防抖)
+        key = f"{signal.contract_name}_{signal.action.value}"
+        last_emit = self.last_signal_emit_times.get(key)
+        if last_emit:
+            time_diff = (current_time - last_emit).total_seconds()
+            if time_diff < 5.0:
+                signal.is_valid = False
+                signal.failure_reason = f"Signal Suppressed: <5s ({time_diff:.1f}s)"
+                return False
+        
+        # 更新发射时间
+        self.last_signal_emit_times[key] = current_time
+        return True
     
     def _apply_risk_checks(self, signal: TradeSignal, tick: TickEvent, bars: List[dict], 
                            positions: Dict[str, Position], current_time: datetime, 
@@ -396,11 +440,14 @@ class PureStrategyEngine:
         split = params.get('position_split', 3)
         min_size = params.get('min_open_size', 0.1)
         desired = max(min_size, round(max_pos * ratio / split, 1))
+        
+        # --- 计算持仓占用 ---
         total_holdings = sum(abs(p.size) for p in positions.values())
-        global_avail = max(0.0, self.max_position_size - total_holdings)
         pos = positions.get(contract_name)
         curr_size = abs(pos.size) if pos else 0.0
+        global_avail = max(0.0, self.max_position_size - total_holdings)
         contract_avail = max(0.0, max_pos - curr_size)
+
         final = round(min(desired, global_avail, contract_avail), 1)
         return final if final >= min_size else 0.0
 
