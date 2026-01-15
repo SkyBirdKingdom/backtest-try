@@ -116,17 +116,15 @@ class BacktestEngine:
             )
             
             self.strategy.daily_realized_pnl = self.current_delivery_pnl
-            
-            if signals:
-                sig_list = [signals]
-                for sig in sig_list:
-                    self.recorder.record_signal(sig)
-                    if sig.is_valid:
-                        self.exchange.submit_order(sig)
-                    else:
-                        self.reject_counter += 1
-                        if self.reject_counter % 2000 == 0:
-                            logger.info(f"🚫 信号被拒(采样): {sig.contract_name} 原因: [{sig.failure_reason}] DeliveryPnL: {self.current_delivery_pnl:.2f}")
+
+            for sig in signals:
+                self.recorder.record_signal(sig)
+                if sig.is_valid:
+                    self.exchange.submit_order(sig)
+                else:
+                    self.reject_counter += 1
+                    if self.reject_counter % 2000 == 0:
+                        logger.info(f"🚫 信号被拒(采样): {sig.contract_name} 原因: [{sig.failure_reason}] DeliveryPnL: {self.current_delivery_pnl:.2f}")
 
         # 回测结束
         self._on_backtest_finished()

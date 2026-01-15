@@ -94,25 +94,13 @@ class PureStrategyEngine:
             logger.info(f"💓 策略运行中... DailyPnL: {self.daily_realized_pnl:.2f} (Limit: -{self.daily_loss_limit})")
 
         # 4. 全局日内风控检查
-        if self.is_risk_triggered:
-            return None
-            
-        if self.daily_realized_pnl <= -self.daily_loss_limit:
-            if not self.is_risk_triggered:
-                logger.error(f"💥 触发日内亏损限额! PnL: {self.daily_realized_pnl:.2f} <= -{self.daily_loss_limit}. 停止今日开仓。")
-                self.is_risk_triggered = True
-            return None
-
+        
         contract_bars = self.bars[tick.contract_name]
         # 5. 调用原有的 calculate_signals
         signals = self.calculate_signals(tick, contract_bars, positions, active_orders, tick.timestamp, self.daily_realized_pnl)
-        
-        if signals:
-            # Engine 期望返回单个 Signal (或 None)
-            # 这里简单取第一个有效信号
-            return signals[0]
-            
-        return None
+
+
+        return signals
 
     def _update_bars(self, tick: TickEvent):
         """简易的 K 线合成器 (1分钟)"""
@@ -188,30 +176,31 @@ class PureStrategyEngine:
             raw_signals.append(sig_ext)
         
         # --- 策略 3: 高波动 ---
-        sig_vol = self._high_volatility_dip_buy(tick, positions, current_time)
-        if sig_vol:
-            self._apply_risk_checks(sig_vol, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True)
-            raw_signals.append(sig_vol)
+        # sig_vol = self._high_volatility_dip_buy(tick, positions, current_time)
+        # if sig_vol:
+        #     self._apply_risk_checks(sig_vol, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True)
+        #     raw_signals.append(sig_vol)
 
         # --- 策略 4: 交付时间 ---
-        sig_del = self._delivery_time_buy_strategy(tick, positions, current_time)
-        if sig_del:
-            self._apply_risk_checks(sig_del, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True, skip_close_time=True)
-            raw_signals.append(sig_del)
+        # sig_del = self._delivery_time_buy_strategy(tick, positions, current_time)
+        # if sig_del:
+        #     self._apply_risk_checks(sig_del, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True, skip_close_time=True)
+        #     raw_signals.append(sig_del)
 
         # =========================================================
         # 【新增】生产环境逻辑检查 (信号抑制 + 订单互斥)
         # =========================================================
-        valid_signals = []
+        signals = []
         for sig in raw_signals:
             if not sig.is_valid: 
-                continue # 已经被前面的基础风控拦截了
+                signals.append(sig) # 已经被前面的基础风控拦截了
+                continue
             
             # 执行生产环境检查
-            if self._check_production_constraints(sig, active_orders, current_time):
-                valid_signals.append(sig)
-                
-        return valid_signals
+            sig.is_valid = self._check_production_constraints(sig, active_orders, current_time)
+            signals.append(sig)
+
+        return signals
     
     def _check_production_constraints(self, signal: TradeSignal, active_orders: List[Order], current_time: datetime) -> bool:
         """
@@ -273,9 +262,15 @@ class PureStrategyEngine:
         if not self._validate_signal(signal, positions):
             signal.is_valid = False
             return
+        
+        if self.is_risk_triggered:
+            signal.is_valid = False
+            signal.failure_reason = "Global Risk Triggered"
+            return
 
         # 4. 日亏损限制
         if current_daily_pnl < -self.daily_loss_limit:
+            self.is_risk_triggered = True
             signal.is_valid = False
             signal.failure_reason = f"Daily Loss Limit Hit: {current_daily_pnl:.2f} < -{self.daily_loss_limit}"
             return
@@ -290,6 +285,20 @@ class PureStrategyEngine:
         # 6. 更新冷却时间
         if signal.is_valid:
             self.last_trade_times[tick.contract_name + signal.strategy_name] = current_time
+
+
+    def _validate_ph_signal(self, signal: TradeSignal) -> bool:
+        """验证PH信号的特定逻辑"""
+        if signal.contract_name.startswith("PH"):
+            original_size = signal.size
+            signal.size = round(signal.size / 4, 1)  # 四舍五入到小数点后一位
+            if signal.size < 0.1:
+                msg = f"信号验证失败 - PH信号调整后仓位过小: 合约={signal.contract_name}, 策略={signal.strategy_name}, 动作={signal.action.value}, 原始数量={original_size}, 调整后数量={signal.size}, 价格={signal.price}, trade_id={getattr(signal, 'trade_id', '')}, trade_time={getattr(signal, 'trade_time', '')}"
+                logger.warning(msg)
+                return False  # If size is too small, immediately return False
+            logger.info(f"PH信号仓位调整: 合约={signal.contract_name}, 原始数量={original_size}, 调整后数量={signal.size}")
+            return True  # If it's a PH signal and size is sufficient, return True
+        return True
 
     def _check_cooldown(self, signal: TradeSignal, current_time: datetime) -> bool:
         strategy_name = signal.strategy_name
@@ -409,6 +418,83 @@ class PureStrategyEngine:
             if existing_position.timestamp >= five_minutes_ago:
                 signal.failure_reason = "Recent Position (<5m)"
                 return False
+            # 检查是否为导致亏损的平仓信号
+            if not self._validate_profit_close(signal, existing_position):
+                return False
+            # 检查合约在5分钟内是否有持仓
+            if not self._validate_recent_position(signal, existing_position):
+                return False
+        # 验证PH信号
+        if not self._validate_ph_signal(signal):
+            return False
+        return True
+
+    def _validate_recent_position(self, signal: TradeSignal, position: Position) -> bool:
+        """验证合约在5分钟内是否有相同策略的持仓，如果有则跳过信号
+
+        Args:
+            signal: 交易信号
+            positions: 当前持仓列表
+
+        Returns:
+            bool: True表示可以继续处理信号，False表示应该跳过信号
+        """
+        # 计算5分钟前的时间
+        five_minutes_ago = signal.timestamp - timedelta(minutes=5)
+        if (position.contract_name == signal.contract_name and
+                position.strategy_name == signal.strategy_name and  # 添加策略名称验证
+                abs(position.size) > 0.001 and
+                position.timestamp >= five_minutes_ago):
+            # 如果该合约和策略在5分钟内有持仓，跳过信号
+            msg = (f"信号验证失败 - 合约5分钟内有相同策略持仓: 合约={signal.contract_name}, 策略={signal.strategy_name}, "
+                   f"动作={signal.action.value}, 数量={signal.size}, 价格={signal.price}, trade_id={getattr(signal, 'trade_id', '')}, "
+                   f"trade_time={getattr(signal, 'trade_time', '')}, 持仓合约={position.contract_name}, 策略={position.strategy_name}, "
+                   f"持仓时间={position.timestamp}, 比较时间={five_minutes_ago}")
+            logger.info(msg)
+            return False
+
+        return True
+
+
+    def _validate_profit_close(self, signal: TradeSignal, target_position: Position) -> bool:
+        """验证平仓信号是否盈利
+        """
+
+        # 2. 找到对应的持仓
+        if not target_position:
+            # 没有持仓，说明是开仓信号（或持仓已平），不适用此规则
+            return True
+
+        # 3. 判断是否为平仓/减仓方向
+        is_closing = False
+        if target_position.size > 0 and signal.action == ActionType.SELL:
+            is_closing = True
+        elif target_position.size < 0 and signal.action == ActionType.BUY:
+            is_closing = True
+
+        if not is_closing:
+            return True
+
+        # 4. 计算预期盈亏
+        # 考虑手续费，不考虑size
+        fee_per_mw = float(self.config.get('transaction_cost', 0.22))
+        total_fee_per_unit = 2 * fee_per_mw  # 开仓+平仓手续费
+
+        is_profitable = False
+        if target_position.size > 0:  # 多头，卖出平仓
+            # 卖出价格必须高于 (持仓均价 + 双边手续费)
+            if signal.price >= (target_position.avg_price + total_fee_per_unit):
+                is_profitable = True
+        else:  # 空头，买入平仓
+            # 买入价格必须低于 (持仓均价 - 双边手续费)
+            if signal.price <= (target_position.avg_price - total_fee_per_unit):
+                is_profitable = True
+
+        if not is_profitable:
+            logger.info(
+                f"信号验证失败: 平仓会导致亏损 (策略={signal.strategy_name}), 合约={signal.contract_name}, 持仓均价={target_position.avg_price:.2f}, 信号价格={signal.price:.2f}, 手续费/MW={fee_per_mw:.2f}")
+            return False
+
         return True
 
     def _get_delivery_rule_config(self, delivery_start: Union[str, datetime]) -> Tuple[float, Dict]:
