@@ -51,7 +51,7 @@ class DataLoader:
             
         # 【关键修改】排序逻辑：交付日优先 -> 合约名次之 -> 交易时间最后
         # 这保证了回测是 "一个合约接一个合约" 进行的
-        query_sql += " ORDER BY delivery_start ASC, contract_name ASC, trade_time ASC"
+        query_sql += " ORDER BY trade_time ASC, contract_name ASC"
 
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)

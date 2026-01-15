@@ -5,6 +5,7 @@ from typing import List, Dict, Optional, Set, Tuple, Union
 from datetime import datetime, timedelta
 from scipy.stats import linregress 
 from collections import deque
+from collections import defaultdict
 
 from core.models import TickEvent, TradeSignal, ActionType, Position, Order
 
@@ -39,8 +40,11 @@ class PureStrategyEngine:
         self.is_risk_triggered = False
         
         # --- 【新增】内置Bar合成器 (Tick -> Bar) ---
-        self.bars: List[dict] = []
-        self.current_bar: Optional[dict] = None
+        # self.bars: List[dict] = []
+        # self.current_bar: Optional[dict] = None
+
+        self.bars: Dict[str, List[dict]] = defaultdict(list)
+        self.current_bars: Dict[str, dict] = {}
 
     # ----------------------------------------------------------------
     # 【新增】生命周期方法 (Engine 调用接口)
@@ -60,6 +64,8 @@ class PureStrategyEngine:
         for k in list(self.price_history.keys()):
             if len(self.price_history[k]) > 500: 
                 self.price_history[k] = self.price_history[k][-100:]
+        self.bars.clear()
+        self.current_bars.clear()
 
     def update_pnl(self, pnl: float):
         """更新策略感知的 PnL (备用接口)"""
@@ -94,9 +100,9 @@ class PureStrategyEngine:
                 self.is_risk_triggered = True
             return None
 
+        contract_bars = self.bars[tick.contract_name]
         # 5. 调用原有的 calculate_signals
-        # 注意：calculate_signals 需要 bars，我们传入刚刚合成的 self.bars
-        signals = self.calculate_signals(tick, self.bars, positions, tick.timestamp, self.daily_realized_pnl)
+        signals = self.calculate_signals(tick, contract_bars, positions, tick.timestamp, self.daily_realized_pnl)
         
         if signals:
             # Engine 期望返回单个 Signal (或 None)
@@ -107,17 +113,23 @@ class PureStrategyEngine:
 
     def _update_bars(self, tick: TickEvent):
         """简易的 K 线合成器 (1分钟)"""
+
+        c_name = tick.contract_name
+        current_bar = self.current_bars.get(c_name)
+
         # 如果是新的分钟，归档旧 Bar
-        if self.current_bar and tick.timestamp.minute != self.current_bar['start_time'].minute:
-            self.bars.append(self.current_bar)
+        if current_bar and tick.timestamp.minute != current_bar['start_time'].minute:
+            self.bars[c_name].append(current_bar)
             # 保持 Bars 长度在合理范围 (只保留最近 300 根用于趋势计算)
-            if len(self.bars) > 300:
-                self.bars.pop(0)
-            self.current_bar = None
+            if len(self.bars[c_name]) > 300:
+                self.bars[c_name].pop(0)
+
+            del self.current_bars[c_name]
+            current_bar = None
             
         # 更新或创建当前 Bar
-        if not self.current_bar:
-            self.current_bar = {
+        if not current_bar:
+            self.current_bars[c_name] = {
                 'start_time': tick.timestamp,
                 'open': tick.price,
                 'high': tick.price,
@@ -128,12 +140,16 @@ class PureStrategyEngine:
                 'trade_count': 1
             }
         else:
-            self.current_bar['high'] = max(self.current_bar['high'], tick.price)
-            self.current_bar['low'] = min(self.current_bar['low'], tick.price)
-            self.current_bar['close'] = tick.price
-            self.current_bar['volume'] += tick.volume
-            self.current_bar['avg_price'] = (self.current_bar['avg_price'] * self.current_bar['trade_count'] + tick.price) / (self.current_bar['trade_count'] + 1)
-            self.current_bar['trade_count'] += 1
+            current_bar['high'] = max(current_bar['high'], tick.price)
+            current_bar['low'] = min(current_bar['low'], tick.price)
+            current_bar['close'] = tick.price
+            current_bar['volume'] += tick.volume
+            # 均价计算
+            current_bar['avg_price'] = (current_bar['avg_price'] * current_bar['trade_count'] + tick.price) / (current_bar['trade_count'] + 1)
+            current_bar['trade_count'] += 1
+            
+            # 写回字典（如果是引用类型其实不需要，但为了保险）
+            self.current_bars[c_name] = current_bar
 
     # ----------------------------------------------------------------
     # 以下为您原始的业务逻辑 (calculate_signals 及辅助方法)
