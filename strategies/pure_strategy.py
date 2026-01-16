@@ -67,8 +67,8 @@ class PureStrategyEngine:
         for k in list(self.price_history.keys()):
             if len(self.price_history[k]) > 500: 
                 self.price_history[k] = self.price_history[k][-100:]
-        self.bars.clear()
-        self.current_bars.clear()
+        # self.bars.clear()
+        # self.current_bars.clear()
 
     def update_pnl(self, pnl: float):
         """更新策略感知的 PnL (备用接口)"""

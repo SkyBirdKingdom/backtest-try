@@ -202,10 +202,11 @@ class VirtualExchange:
         for order in list(self.active_orders):
             if order.contract_name != tick.contract_name:
                 continue
-            
-            # time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
-            # if time_since_creation < self.order_submission_delay:
-            #     continue
+
+            # 订单提交增加延迟
+            time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
+            if time_since_creation < self.order_submission_delay:
+                continue
 
             # 【核心修改】如果是强平单，无视价格限制，强制成交 (Market Order)
             is_force_close = (order.strategy == "force_close_final")

@@ -98,7 +98,8 @@ class PureExitManager:
                 progress = elapsed / total_duration
                 progress = max(0.0, min(1.0, progress))
             
-            start_margin = 0.50 if entry_price < 50 else 0.20
+            start_margin = 0.50 if entry_price < 50 else 0.30
+            # start_margin = 0.50
             end_margin = 0.01
             current_margin = start_margin - (start_margin - end_margin) * progress
             
