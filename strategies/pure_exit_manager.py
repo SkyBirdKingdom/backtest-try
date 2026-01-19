@@ -17,6 +17,11 @@ class PureExitManager:
     def __init__(self, config: dict):
         self.config = config
         self.transaction_cost = config.get('transaction_cost', 0.23)
+        self.params = config.get('strategy_params', {})
+        self.forbid_new_open_minutes = int(self.params.get('forbid_new_open_minutes', 60))
+        self.take_profit_end_minutes = int(self.params.get('take_profit_end_minutes', 10))
+        self.breakeven_end_minutes = int(self.params.get('breakeven_end_minutes', 6))
+        self.stop_loss_end_minutes = int(self.params.get('stop_loss_end_minutes', 3))
         self.last_order_update_time: Dict[str, datetime] = {}
 
     def process(self, tick: TickEvent, positions: Dict[str, Position], 
@@ -25,6 +30,18 @@ class PureExitManager:
             return
 
         minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
+
+        if minutes_to_close <= self.forbid_new_open_minutes: 
+            # 遍历所有订单，撤销非平仓单
+            for order in list(active_orders): # 使用 list副本以允许遍历时修改
+                if order.contract_name == tick.contract_name:
+                    # 如果不是平仓策略 (auto_profit_taking 或 force_close)，则强制撤销
+                    is_exit_strategy = (order.strategy.startswith("auto_profit_taking") or 
+                                        order.strategy.startswith("force_close"))
+                    
+                    if not is_exit_strategy:
+                        exchange.cancel_order(order.client_order_id)
+                        logger.info(f"🛑 [禁区风控] 进入关闸前{self.forbid_new_open_minutes}分钟，强制撤销残留开仓单: {order.client_order_id}")
         
         if minutes_to_close > 240 or minutes_to_close <= 0:
             return
@@ -89,15 +106,15 @@ class PureExitManager:
         is_force_market = False
 
         # --- 阶段 1: 止盈阶段 ---
-        if 20 < minutes_to_close <= 240:
+        if self.forbid_new_open_minutes < minutes_to_close <= 240:
             # 使用初始建仓时间计算进度
             start_time = position.initial_entry_time if position.initial_entry_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
-            if start_minutes_to_close <= 20:
+            if start_minutes_to_close <= self.take_profit_end_minutes:
                 progress = 1.0
             else:
-                total_duration = start_minutes_to_close - 20
+                total_duration = start_minutes_to_close - self.take_profit_end_minutes
                 elapsed = start_minutes_to_close - minutes_to_close
                 progress = elapsed / total_duration
                 progress = max(0.0, min(1.0, progress))
@@ -118,13 +135,13 @@ class PureExitManager:
                 target_price = min(decay_price, tick.price)
 
         # --- 阶段 2: 保本阶段 ---
-        elif 10 < minutes_to_close <= 20:
+        elif self.breakeven_end_minutes < minutes_to_close <= self.take_profit_end_minutes:
             breakeven_price = (entry_price + cost_padding) if is_long else (entry_price - cost_padding)
             if is_long: target_price = max(breakeven_price, tick.price)
             else: target_price = min(breakeven_price, tick.price)
 
         # --- 阶段 3: 止损阶段 ---
-        elif 3 < minutes_to_close <= 10:
+        elif self.stop_loss_end_minutes < minutes_to_close <= self.breakeven_end_minutes:
             loss_limit = 0.20
             if is_long:
                 stop_price = entry_price * (1 - loss_limit) + cost_padding
@@ -134,7 +151,7 @@ class PureExitManager:
                 target_price = min(stop_price, tick.price)
 
         # --- 阶段 4: 强平阶段 ---
-        elif minutes_to_close <= 3:
+        elif minutes_to_close <= self.stop_loss_end_minutes:
             target_price = tick.price
             is_force_market = True 
 

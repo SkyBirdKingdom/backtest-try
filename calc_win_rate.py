@@ -147,5 +147,5 @@ def calculate_round_trip_stats(db_url):
 
 if __name__ == "__main__":
     # 请替换为您的真实数据库地址
-    DB_URL = "postgresql://postgres:123456@192.168.0.179:5432/nordpool_db"
+    DB_URL = "postgresql://postgres:123456@192.168.0.19:5432/nordpool_db"
     calculate_round_trip_stats(DB_URL)

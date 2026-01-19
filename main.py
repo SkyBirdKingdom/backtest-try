@@ -44,7 +44,7 @@ def clear_tables_except_trades(db_url: str):
 
 def main():
     # 1. 数据库配置
-    DB_URL = "postgresql://postgres:123456@192.168.0.179:5432/nordpool_db?client_encoding=utf8"
+    DB_URL = "postgresql://postgres:123456@127.0.0.1:5432/nordpool_db?client_encoding=utf8"
     
     # 2. 策略配置
     config = {
@@ -64,6 +64,10 @@ def main():
             "forbid_new_open_minutes": 20,
             "signal_cooldown_seconds": 300,
             "price_change_threshold_ratio": 0.1,
+
+            "take_profit_end_minutes": 10,
+            "breakeven_end_minutes": 6,
+            "stop_loss_end_minutes": 3,
             
             "super_mean_reversion_buy": {
                 "action": "BUY",
