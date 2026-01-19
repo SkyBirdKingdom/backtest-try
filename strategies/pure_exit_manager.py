@@ -31,6 +31,10 @@ class PureExitManager:
 
         position = positions.get(tick.contract_name)
         if not position or abs(position.size) < 0.001:
+            existing_exit_order = self._find_exit_order(tick.contract_name, active_orders)
+            if existing_exit_order:
+                exchange.cancel_order(existing_exit_order.client_order_id)
+                logger.info(f"🧹 清理幽灵平仓单: {tick.contract_name} (持仓已归零)")
             return
 
         # 获取属于本管理器的平仓单

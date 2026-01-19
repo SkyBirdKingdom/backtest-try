@@ -163,6 +163,8 @@ class VirtualExchange:
                     changes.append("PRICE")
                 
                 if new_quantity is not None and abs(order.remaining_quantity - new_quantity) > 0.001:
+                    if order.remaining_quantity < order.quantity and new_quantity > order.remaining_quantity:
+                        logger.warning(f"⚠️ 订单 {order.client_order_id} 在部分成交后被重置数量: {order.remaining_quantity} -> {new_quantity}")
                     order.quantity = new_quantity
                     order.remaining_quantity = new_quantity
                     order.match_wait_count = 0 

@@ -213,10 +213,9 @@ class PureStrategyEngine:
             if order.contract_name == signal.contract_name:
                 if order.side == signal.action.value:
                     # 排除平仓单 (auto_profit_taking, force_close)
-                    if not (order.strategy.startswith("auto_profit_taking") or order.strategy.startswith("force_close")):
-                        signal.is_valid = False
-                        signal.failure_reason = f"Production Limit: Active Order Exists ({order.client_order_id})"
-                        return False
+                    signal.is_valid = False
+                    signal.failure_reason = f"Production Limit: Active Order Exists ({order.client_order_id})"
+                    return False
 
         # 2. 信号抑制 (5秒防抖)
         key = f"{signal.contract_name}_{signal.action.value}"
