@@ -190,7 +190,7 @@ class VirtualExchange:
 
     def _check_order_timeout(self):
         for order in list(self.active_orders):
-            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking":
+            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking" or order.strategy.startswith("force_close") or order.strategy == "consecutive_loss_stop":
                 continue
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
@@ -319,22 +319,41 @@ class VirtualExchange:
 
         pos = self.positions[key]
         old_size = pos.size
-        new_size = round(old_size + size_delta, 3) 
+        new_size = round(old_size + size_delta, 1) 
         
         is_increase = abs(new_size) > abs(old_size)
         is_reversal = (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0)
         
-        if is_reversal or is_increase:
+        # 1. 初始建仓时间
+        if is_reversal or (old_size == 0 and abs(new_size) > 0):
             pos.initial_entry_time = self.current_time
+            # 反手时，重置所有状态
+            pos.has_triggered_2nd_add = False
+            pos.has_reversed = False 
+            # 如果这是一个反手策略的成交，标记它已经反手过了
+            if "reversal" in order.strategy:
+                pos.has_reversed = True
+
+        # 2. 【核心】检测二次加仓 (用于严格模式止损)
+        # 如果是加仓行为，且当前不是空仓，且不是反手
+        if is_increase and old_size != 0 and not is_reversal:
+            # 这里简单处理：只要发生过加仓，就认为触发了
+            pos.has_triggered_2nd_add = True
+            logger.info(f"[{key}] 触发加仓标记 (Old: {old_size} -> New: {new_size})")
             
+        # 3. 成本计算 (加权平均)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
+            # 加仓 or 建仓
             total_val = abs(old_size) * pos.avg_price + abs(size_delta) * price
             if abs(new_size) > 0:
                 pos.avg_price = total_val / abs(new_size)
             pos.size = new_size
-            pos.strategy_name = order.strategy 
+            # 只有当持仓反转或从0开始时才更新策略名，加仓不改变主要策略名
+            if old_size == 0 or is_reversal:
+                pos.strategy_name = order.strategy 
             
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
+            # 减仓 or 平仓
             closed_qty = min(abs(old_size), abs(size_delta))
             raw_pnl = 0.0
             if old_size > 0: 

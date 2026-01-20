@@ -110,6 +110,10 @@ class Position:
     # 【新增】初始建仓时间，用于计算动态止盈的衰减起点
     initial_entry_time: Optional[datetime] = None
 
+    # --- 【新增】实盘逻辑状态字段 ---
+    has_triggered_2nd_add: bool = False  # 是否触发过二次加仓 (严格模式止损依据)
+    has_reversed: bool = False           # 是否已经执行过反手 (防止反复反手)
+
 @dataclass
 class AccountInfo:
     """账户资金快照"""

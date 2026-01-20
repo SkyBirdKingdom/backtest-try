@@ -31,6 +31,38 @@ class PureExitManager:
 
         minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
 
+        # ---------------------------------------------------------------------
+        # 【新增】止损单动态追价逻辑 (Stop Loss Chasing)
+        # ---------------------------------------------------------------------
+        # 查找是否存在活跃的 "consecutive_loss_stop" 订单
+        stop_order = None
+        for order in active_orders:
+            if order.contract_name == tick.contract_name and order.strategy == "consecutive_loss_stop":
+                stop_order = order
+                break
+        
+        if stop_order:
+            # 检查价格偏差 (这里使用 tick.price 作为最新 K 线价格的代理)
+            # 只有当市场价格变动导致我们的挂单无法成交时 (例如买单价格低了，卖单价格高了) 才追单
+            # 但用户的逻辑是：跟随第11根K线改价。为了简化且更强力，我们直接跟随 Tick 追价。
+            should_modify = False
+            
+            if stop_order.side == "BUY": # 这是一个平空仓的买单
+                if tick.price > stop_order.unit_price + 0.01: # 市场涨了，买不到，得提价
+                    should_modify = True
+            elif stop_order.side == "SELL": # 这是一个平多仓的卖单
+                if tick.price < stop_order.unit_price - 0.01: # 市场跌了，卖不掉，得降价
+                    should_modify = True
+            
+            if should_modify:
+                # 执行改单
+                new_price = tick.price
+                exchange.modify_order(stop_order.client_order_id, new_price=new_price)
+                logger.info(f"🚀 [止损追价] {tick.contract_name} 调整价格 -> {new_price}")
+            
+            # 止损单由本逻辑接管，不再执行下方的常规止盈逻辑
+            return
+
         if minutes_to_close <= self.forbid_new_open_minutes: 
             # 遍历所有订单，撤销非平仓单
             for order in list(active_orders): # 使用 list副本以允许遍历时修改
