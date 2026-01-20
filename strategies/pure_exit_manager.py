@@ -172,7 +172,7 @@ class PureExitManager:
             if is_long: target_price = max(breakeven_price, tick.price)
             else: target_price = min(breakeven_price, tick.price)
 
-        # --- 阶段 3: 止损阶段 ---
+        # --- 阶段 3: 少亏阶段 ---
         elif self.stop_loss_end_minutes < minutes_to_close <= self.breakeven_end_minutes:
             loss_limit = 0.20
             if is_long:
