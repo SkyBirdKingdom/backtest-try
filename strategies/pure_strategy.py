@@ -123,18 +123,18 @@ class PureStrategyEngine:
         if normal_signals:
             raw_signals.extend(normal_signals)
 
-        # 5. 合并与生产环境约束检查
-        final_signals = []
-        for sig in raw_signals:
-            if not sig.is_valid:
-                final_signals.append(sig)
-                continue
+        # # 5. 合并与生产环境约束检查
+        # final_signals = []
+        # for sig in raw_signals:
+        #     if not sig.is_valid:
+        #         final_signals.append(sig)
+        #         continue
             
-            # 检查：如果有活跃的反手/开仓单，不再发单
-            sig.is_valid = self._check_production_constraints(sig, active_orders, tick.timestamp)
-            final_signals.append(sig)
+        #     # 检查：如果有活跃的反手/开仓单，不再发单
+        #     sig.is_valid = self._check_production_constraints(sig, active_orders, tick.timestamp)
+        #     final_signals.append(sig)
 
-        return final_signals
+        return raw_signals
 
     def _update_bars(self, tick: TickEvent):
         """简易的 K 线合成器 (1分钟)"""
