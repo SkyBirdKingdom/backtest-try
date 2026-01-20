@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from scipy.stats import linregress 
 from collections import deque
 from collections import defaultdict
+import math
 
 from core.models import TickEvent, TradeSignal, ActionType, Position, Order
 
@@ -36,6 +37,14 @@ class PureStrategyEngine:
         # 【新增】记录上一次发出信号的时间 (Key: Contract_Action)
         self.last_signal_emit_times: Dict[str, datetime] = {}
 
+        # --- 【新增】实盘止损策略参数 ---
+        self.high_price_profit_multiplier = 1.02
+        self.low_price_profit_multiplier = 1.05
+        self.consecutive_loss_count: Dict[str, int] = defaultdict(int)
+        self.last_position_avg_price: Dict[str, float] = {}
+        self.processed_market_data_ids: Set[str] = set() # 用于K线去重
+        self.executed_reverse_strategies: Set[str] = set() # 记录已反手的合约
+
         # --- 【新增】诊断与生命周期管理 ---
         self.tick_counter = 0
         self.current_date = None
@@ -43,9 +52,6 @@ class PureStrategyEngine:
         self.is_risk_triggered = False
         
         # --- 【新增】内置Bar合成器 (Tick -> Bar) ---
-        # self.bars: List[dict] = []
-        # self.current_bar: Optional[dict] = None
-
         self.bars: Dict[str, List[dict]] = defaultdict(list)
         self.current_bars: Dict[str, dict] = {}
 
@@ -62,13 +68,17 @@ class PureStrategyEngine:
         
         # 清理单日执行标记
         self.delivery_time_strategy_executed.clear()
+
+        # 清理止损策略状态
+        self.consecutive_loss_count.clear()
+        self.last_position_avg_price.clear()
+        self.processed_market_data_ids.clear()
+        self.executed_reverse_strategies.clear()
         
         # 清理过期的价格缓存
         for k in list(self.price_history.keys()):
             if len(self.price_history[k]) > 500: 
                 self.price_history[k] = self.price_history[k][-100:]
-        # self.bars.clear()
-        # self.current_bars.clear()
 
     def update_pnl(self, pnl: float):
         """更新策略感知的 PnL (备用接口)"""
@@ -96,11 +106,20 @@ class PureStrategyEngine:
         # 4. 全局日内风控检查
         
         contract_bars = self.bars[tick.contract_name]
+
+        # --- 【新增】插入：连续亏损止损策略检查 ---
+        stop_loss_signals = []
+        position = positions.get(tick.contract_name)
+        if position and abs(position.size) > 0.001:
+            sl_sig = self._check_consecutive_loss_stop_loss(tick, position, contract_bars)
+            if sl_sig:
+                stop_loss_signals.extend(sl_sig)
+        
         # 5. 调用原有的 calculate_signals
         signals = self.calculate_signals(tick, contract_bars, positions, active_orders, tick.timestamp, self.daily_realized_pnl)
 
-
-        return signals
+        # 合并信号：优先处理止损
+        return stop_loss_signals + signals
 
     def _update_bars(self, tick: TickEvent):
         """简易的 K 线合成器 (1分钟)"""
@@ -141,6 +160,184 @@ class PureStrategyEngine:
             
             # 写回字典（如果是引用类型其实不需要，但为了保险）
             self.current_bars[c_name] = current_bar
+    
+
+    # =========================================================================
+    # 【修改】实盘连续亏损止损策略逻辑 (1分钟K线版本)
+    # =========================================================================
+
+    def _get_minutes_to_close(self, delivery_start: datetime, current_time: datetime) -> float:
+        gate_closure = delivery_start - timedelta(hours=1)
+        delta = gate_closure - current_time
+        return delta.total_seconds() / 60.0
+
+    def get_loss_ratio(self, size: float, avg_price: float, current_price: float) -> float:
+        """计算亏损率"""
+        if avg_price == 0: return 0.0
+        # 多头: (成本 - 现价) / 成本 -> 正数表示亏损
+        if size > 0:
+            return (avg_price - current_price) / avg_price
+        # 空头: (现价 - 成本) / 成本
+        else:
+            return (current_price - avg_price) / avg_price
+
+    def _check_consecutive_loss_stop_loss(self, tick: TickEvent, position: Position, bars: List[dict]) -> List[TradeSignal]:
+        contract_name = tick.contract_name
+        
+        # 1. 时间窗口检查
+        minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
+        actual_forbid_minutes = self.forbid_new_open_minutes + 20
+        # 如果太临近关闸，交由 ExitManager 处理，这里不再干预
+        if minutes_to_close <= actual_forbid_minutes:
+            return []
+
+        # 2. 获取最新完成的 1分钟K线
+        # 实盘代码: get_five_min_bars(limit=1) -> 实际上是1分钟K线
+        if not bars:
+            return []
+            
+        last_bar = bars[-1] # 获取最新完成的一根K线
+        
+        # 使用 K线时间戳作为唯一ID (实盘逻辑: unique_trade_id = f"{contract_name}_{market_data_trade_id}")
+        unique_trade_id = f"{contract_name}_{last_bar['start_time']}"
+
+        # 如果这个K线ID已经处理过，直接检查是否需要强制执行(计数已满)，否则跳过计数逻辑
+        if unique_trade_id in self.processed_market_data_ids:
+            if self.consecutive_loss_count.get(contract_name, 0) >= 10:
+                # 计数已满，且K线未变，持续尝试触发止损
+                return self._create_stop_loss_signal(tick, position)
+            return []
+
+        # --- 以下是新K线(新的一分钟)的计数逻辑 ---
+        
+        # 标记该K线已处理
+        self.processed_market_data_ids.add(unique_trade_id)
+
+        # 3. 检查持仓均价变化 (重置逻辑)
+        current_avg_price = position.avg_price
+        previous_avg_price = self.last_position_avg_price.get(contract_name, current_avg_price)
+        
+        if abs(current_avg_price - previous_avg_price) > 1e-6:
+             if self.consecutive_loss_count.get(contract_name, 0) > 0:
+                 logger.info(f"[{contract_name}] 持仓均价变化 {previous_avg_price:.2f}->{current_avg_price:.2f}，重置连续亏损计数")
+             self.consecutive_loss_count[contract_name] = 0
+        
+        self.last_position_avg_price[contract_name] = current_avg_price
+
+        # 4. 亏损阈值计算
+        # 注意：实盘使用的是 market_data['avg_price']，即K线均价，而不是当前的 tick.price
+        market_price = last_bar['avg_price']
+        current_loss = self.get_loss_ratio(position.size, position.avg_price, market_price)
+        
+        if abs(position.avg_price) >= 50:
+            loss_threshold = self.high_price_profit_multiplier - 1.1 # 实盘逻辑
+        else:
+            loss_threshold = self.low_price_profit_multiplier - 1
+
+        # 检查是否满足亏损条件
+        if current_loss >= loss_threshold:
+            self.consecutive_loss_count[contract_name] += 1
+            # logger.info(f"[{contract_name}] 连续亏损计数+1 -> {self.consecutive_loss_count[contract_name]} (Loss: {current_loss:.2%}, Thr: {loss_threshold:.2%})")
+        else:
+            if self.consecutive_loss_count.get(contract_name, 0) > 0:
+                # logger.info(f"[{contract_name}] 亏损缓解，重置计数 (Loss: {current_loss:.2%})")
+                self.consecutive_loss_count[contract_name] = 0
+        
+        # 5. 触发止损 (连续10分钟)
+        if self.consecutive_loss_count[contract_name] >= 10:
+            logger.warning(f"[{contract_name}] 🚫 连续10分钟满足亏损/未达标条件，触发止损! K线均价: {market_price}")
+            return self._create_stop_loss_signal(tick, position)
+            
+        return []
+
+    def _create_stop_loss_signal(self, tick: TickEvent, position: Position) -> List[TradeSignal]:
+        """创建止损信号，并尝试反手"""
+        signals = []
+        contract_name = tick.contract_name
+        
+        # 1. 止损平仓信号
+        action = ActionType.SELL if position.size > 0 else ActionType.BUY
+        stop_signal = TradeSignal(
+            timestamp=tick.timestamp,
+            contract_name=contract_name,
+            contract_id=tick.contract_id,
+            action=action,
+            size=abs(position.size),
+            price=tick.price,
+            strategy_name="consecutive_loss_stop", # 区分策略名
+            delivery_start=tick.delivery_start,
+            confidence=0.9,
+            open_strategy=position.strategy_name,
+            failure_reason="StopLoss Triggered" # 标记
+        )
+        signals.append(stop_signal)
+        
+        # 2. 【核心】反手策略 (仅首次触发时执行)
+        # if contract_name not in self.executed_reverse_strategies:
+        #     reverse_sig = self._reverse_open_after_stop_loss(tick, position)
+        #     if reverse_sig:
+        #         logger.info(f"[{contract_name}] 首次止损，触发反手策略!")
+        #         signals.append(reverse_sig)
+        #         self.executed_reverse_strategies.add(contract_name)
+        
+        return signals
+
+    def _reverse_open_after_stop_loss(self, tick: TickEvent, position: Position) -> Optional[TradeSignal]:
+        """
+        反手策略逻辑：
+        分析最近趋势，如果趋势与原持仓方向相反（即与止损方向相同），则顺势开反向仓位。
+        """
+        contract_name = tick.contract_name
+        
+        # 获取最近价格 (使用 1min bars 近 30 分钟)
+        bars = self.bars.get(contract_name, [])
+        if not bars: return None
+        
+        # 取最近 30 分钟的数据
+        cutoff_time = tick.timestamp - timedelta(minutes=30)
+        valid_bars = [b for b in bars if b['start_time'] >= cutoff_time]
+        price_list = [float(b.get('avg_price', b['close'])) for b in valid_bars]
+        
+        if len(price_list) < 3: return None
+        
+        # 趋势分析
+        trend_res = self.detect_trend_with_linear_regression(price_list)
+        trend = trend_res["trend"]
+        confidence = trend_res.get("confidence", 0.0)
+        
+        # 判定反手方向
+        # 原持仓 Long -> Stop Sell -> Reverse Should be Short (Sell)
+        # 原持仓 Short -> Stop Buy -> Reverse Should be Long (Buy)
+        
+        reverse_action = ActionType.SELL if position.size > 0 else ActionType.BUY
+        
+        # 趋势确认
+        trend_matches = False
+        if reverse_action == ActionType.SELL and trend == "下降":
+            trend_matches = True
+        elif reverse_action == ActionType.BUY and trend == "上升":
+            trend_matches = True
+            
+        if trend_matches and confidence > 0.4:
+            # 计算反手仓位 (这里简单处理：开最大单笔限制的一半，或者复用原仓位大小)
+            # 实盘中似乎是新建仓，我们使用 default_contract_max_position 的一半作为尝试
+            new_size = max(0.1, round(self.default_contract_max_position / 2, 1))
+            
+            return TradeSignal(
+                timestamp=tick.timestamp,
+                contract_name=contract_name,
+                contract_id=tick.contract_id,
+                action=reverse_action,
+                size=new_size,
+                price=tick.price,
+                strategy_name="trend_reversal_after_stop_loss", # 特殊策略名
+                delivery_start=tick.delivery_start,
+                confidence=confidence,
+                open_strategy="trend_reversal",
+                trend_info=f"{trend}({confidence:.2f})"
+            )
+            
+        return None
 
     # ----------------------------------------------------------------
     # 以下为您原始的业务逻辑 (calculate_signals 及辅助方法)
