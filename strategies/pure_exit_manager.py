@@ -1,18 +1,22 @@
 import logging
 import math
+import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
+from collections import deque
+from scipy.stats import linregress
+
 from core.models import TickEvent, TradeSignal, ActionType, Position, Order
 
 logger = logging.getLogger("PureExitManager")
 
 class PureExitManager:
     """
-    纯净版平仓管理器 (Lifecycle Manager) - 增强版 V2.4
-    1. 锚定 initial_entry_time 进行动态止盈计算
-    2. 使用 modify_order 进行订单同步
-    3. 目标价格计算：手续费Buffer固定为 0.46
-    4. 【严重Bug修复】_find_exit_order 增加策略名称过滤，防止错误修改建仓单
+    纯净版平仓管理器 (Lifecycle Manager) - 增强版 V3.0
+    1. 整合连续亏损止损逻辑：检测 `stop_loss_triggered` 标志，激进改价。
+    2. 反手策略止盈逻辑：30分钟趋势 + 盈利检查。
+    3. 少亏/强平逻辑更新：引入 Avg(10 Ticks) 价格计算。
     """
     def __init__(self, config: dict):
         self.config = config
@@ -23,67 +27,64 @@ class PureExitManager:
         self.breakeven_end_minutes = int(self.params.get('breakeven_end_minutes', 6))
         self.stop_loss_end_minutes = int(self.params.get('stop_loss_end_minutes', 3))
         self.last_order_update_time: Dict[str, datetime] = {}
+        
+        # 【新增】Tick 历史记录 (用于计算最近10个Tick的均价)
+        self.tick_history: Dict[str, deque] = {} 
 
     def process(self, tick: TickEvent, positions: Dict[str, Position], 
-                active_orders: List[Order], exchange) -> None:
+                active_orders: List[Order], exchange, bars: List[dict] = None) -> None:
         if not tick.delivery_start:
             return
 
         minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
-
-        # ---------------------------------------------------------------------
-        # 【新增】止损单动态追价逻辑 (Stop Loss Chasing)
-        # ---------------------------------------------------------------------
-        # 查找是否存在活跃的 "consecutive_loss_stop" 订单
-        stop_order = None
-        for order in active_orders:
-            if order.contract_name == tick.contract_name and order.strategy == "consecutive_loss_stop":
-                stop_order = order
-                break
         
-        if stop_order:
-            # 检查价格偏差 (这里使用 tick.price 作为最新 K 线价格的代理)
-            # 只有当市场价格变动导致我们的挂单无法成交时 (例如买单价格低了，卖单价格高了) 才追单
-            # 但用户的逻辑是：跟随第11根K线改价。为了简化且更强力，我们直接跟随 Tick 追价。
-            should_modify = False
-            
-            if stop_order.side == "BUY": # 这是一个平空仓的买单
-                if tick.price > stop_order.unit_price + 0.01: # 市场涨了，买不到，得提价
-                    should_modify = True
-            elif stop_order.side == "SELL": # 这是一个平多仓的卖单
-                if tick.price < stop_order.unit_price - 0.01: # 市场跌了，卖不掉，得降价
-                    should_modify = True
-            
-            if should_modify:
-                # 执行改单
-                new_price = tick.price
-                exchange.modify_order(stop_order.client_order_id, new_price=new_price)
-                logger.info(f"🚀 [止损追价] {tick.contract_name} 调整价格 -> {new_price}")
-            
-            # 止损单由本逻辑接管，不再执行下方的常规止盈逻辑
-            return
-
-        if minutes_to_close <= self.forbid_new_open_minutes: 
-            # 遍历所有订单，撤销非平仓单
-            for order in list(active_orders): # 使用 list副本以允许遍历时修改
-                if order.contract_name == tick.contract_name:
-                    # 如果不是平仓策略 (auto_profit_taking 或 force_close)，则强制撤销
-                    is_exit_strategy = (order.strategy.startswith("auto_profit_taking") or 
-                                        order.strategy.startswith("force_close"))
-                    
-                    if not is_exit_strategy:
-                        exchange.cancel_order(order.client_order_id)
-                        logger.info(f"🛑 [禁区风控] 进入关闸前{self.forbid_new_open_minutes}分钟，强制撤销残留开仓单: {order.client_order_id}")
-        
-        if minutes_to_close > 240 or minutes_to_close <= 0:
-            return
+        # 1. 维护 Tick History (用于少亏阶段均价计算)
+        if tick.contract_name not in self.tick_history:
+            self.tick_history[tick.contract_name] = deque(maxlen=10)
+        self.tick_history[tick.contract_name].append(tick.price)
 
         position = positions.get(tick.contract_name)
         if not position or abs(position.size) < 0.001:
-            existing_exit_order = self._find_exit_order(tick.contract_name, active_orders)
+            existing_exit_order = self._find_exit_order(tick.contract_name, active_orders, include_all=True)
             if existing_exit_order:
                 exchange.cancel_order(existing_exit_order.client_order_id)
                 logger.info(f"🧹 清理幽灵平仓单: {tick.contract_name} (持仓已归零)")
+            return
+
+        # ---------------------------------------------------------------------
+        # 【核心逻辑 A】反手策略特殊止盈 (Reverse Strategy Profit Taking)
+        # ---------------------------------------------------------------------
+        # 如果是反手策略产生的持仓，且在进入少亏阶段之前
+        if position.open_strategy == "trend_reversal" and minutes_to_close > self.breakeven_end_minutes:
+            if self._check_reverse_profit_exit(tick, position, bars):
+                # 如果满足反手止盈条件，直接以当前价挂单/改单
+                self._submit_or_modify_reverse_exit(exchange, position, tick, active_orders)
+                return
+
+        # ---------------------------------------------------------------------
+        # 【核心逻辑 B】止损单接管逻辑 (Stop Loss Chasing)
+        # ---------------------------------------------------------------------
+        # 如果 Strategy 标记了止损触发，ExitManager 接管所有改价逻辑
+        if position.stop_loss_triggered:
+            self._handle_stop_loss_chasing(exchange, position, tick, active_orders, minutes_to_close)
+            # 止损接管后，不再执行后续常规生命周期
+            return
+
+        # ---------------------------------------------------------------------
+        # 【核心逻辑 C】常规生命周期 (Profit -> Breakeven -> Reduce Loss -> Force)
+        # ---------------------------------------------------------------------
+        
+        # 0. 关闸前撤销非平仓单
+        if minutes_to_close <= self.forbid_new_open_minutes: 
+            for order in list(active_orders): 
+                if order.contract_name == tick.contract_name:
+                    is_exit_strategy = (order.strategy.startswith("auto_profit") or 
+                                        order.strategy.startswith("force_close"))
+                    if not is_exit_strategy:
+                        exchange.cancel_order(order.client_order_id)
+                        logger.info(f"🛑 [禁区风控] 强制撤销残留开仓单: {order.client_order_id}")
+        
+        if minutes_to_close > 240 or minutes_to_close <= 0:
             return
 
         # 获取属于本管理器的平仓单
@@ -92,11 +93,9 @@ class PureExitManager:
         # 1. 检测数量是否一致 (Sync Check)
         qty_mismatch = False
         if existing_exit_order:
-            # 如果持仓 != 挂单剩余，说明发生了部分成交或加仓，需要更新订单
             if abs(abs(position.size) - existing_exit_order.remaining_quantity) > 0.001:
                 qty_mismatch = True
         elif not existing_exit_order:
-            # 如果没有平仓单，但有持仓，说明需要新挂单
             qty_mismatch = True
 
         # 2. 计算目标价格
@@ -109,6 +108,123 @@ class PureExitManager:
             exchange, position, tick, existing_exit_order, 
             target_price, is_force_market, minutes_to_close, qty_mismatch
         )
+
+    # ----------------------------------------------------------------
+    # 辅助逻辑实现
+    # ----------------------------------------------------------------
+
+    def _handle_stop_loss_chasing(self, exchange, position: Position, tick: TickEvent, active_orders: List[Order], minutes_to_close: float):
+        """
+        处理触发止损后的激进改价
+        规则：持续修改价格，不撤销，直到成交。
+        """
+        target_price = tick.price
+        
+        # 如果进入了强平阶段，强制市价
+        if minutes_to_close <= self.stop_loss_end_minutes:
+            is_force_market = True
+        else:
+            is_force_market = False
+            
+        # 查找现有订单 (任意类型的平仓单：auto_profit 或 consecutive_loss_stop)
+        existing_order = None
+        for order in active_orders:
+            if order.contract_name == tick.contract_name and \
+               (order.strategy.startswith("auto_profit") or order.strategy == "consecutive_loss_stop" or order.strategy.startswith("trend_reversal")):
+                existing_order = order
+                break
+        
+        if is_force_market:
+            if existing_order: exchange.cancel_order(existing_order.client_order_id)
+            self._submit_force_close(exchange, position, tick)
+            return
+
+        if existing_order:
+            # 只有价格偏离时才修改，避免过于频繁
+            if abs(existing_order.unit_price - target_price) > 0.01:
+                exchange.modify_order(existing_order.client_order_id, new_price=target_price)
+                logger.info(f"🚀 [止损追价] {tick.contract_name} 调整价格 -> {target_price}")
+        else:
+            # 如果没有订单，新建一个
+            self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name="consecutive_loss_stop")
+
+    def _check_reverse_profit_exit(self, tick: TickEvent, position: Position, bars: List[dict]) -> bool:
+        """
+        反手策略止盈检查：
+        1. 取最近30分钟(不含当前)的近10个bar
+        2. 趋势改变 & 且置信度 > 0.4
+        3. 盈利 > 0 (含手续费)
+        """
+        if not bars: return False
+        
+        # 1. 准备数据
+        cutoff_time = tick.timestamp - timedelta(minutes=30)
+        # 排除当前正在生成的Bar (通常 Engine 传进来的是已完成的 Bars, 但为了保险起见，取截止到上一分钟)
+        current_minute = tick.timestamp.replace(second=0, microsecond=0)
+        
+        valid_bars = [b for b in bars if b['start_time'] >= cutoff_time and b['start_time'] < current_minute]
+        if len(valid_bars) > 10:
+            valid_bars = valid_bars[-10:] # 取最近10个
+            
+        prices = [float(b['close']) for b in valid_bars]
+        if len(prices) < 3: return False
+        
+        # 2. 趋势计算
+        trend_res = self._detect_trend(prices)
+        confidence = trend_res['confidence']
+        trend = trend_res['trend']
+        
+        # 判断趋势是否反转 (对于反手策略来说，我们希望顺势。如果趋势反转了，就该跑了)
+        # 比如：反手是做空，如果趋势变成上升，且置信度高，则平仓
+        should_exit_trend = False
+        if position.size > 0: # 当前持多
+            if trend == "下降" and confidence > 0.4: should_exit_trend = True
+        else: # 当前持空
+            if trend == "上升" and confidence > 0.4: should_exit_trend = True
+            
+        if not should_exit_trend:
+            return False
+            
+        # 3. 盈利检查
+        cost = position.avg_price
+        fee = self.transaction_cost * 2 # 双边
+        is_profitable = False
+        
+        if position.size > 0:
+            if tick.price > (cost + fee): is_profitable = True
+        else:
+            if tick.price < (cost - fee): is_profitable = True
+            
+        return is_profitable
+
+    def _submit_or_modify_reverse_exit(self, exchange, position: Position, tick: TickEvent, active_orders: List[Order]):
+        target_price = tick.price
+        
+        # 查找现有订单
+        existing = self._find_exit_order(tick.contract_name, active_orders)
+        
+        if existing:
+            if abs(existing.unit_price - target_price) > 0.01:
+                exchange.modify_order(existing.client_order_id, new_price=target_price)
+                logger.info(f"🔄 [反手止盈] 更新价格 {tick.contract_name} -> {target_price}")
+        else:
+            self._submit_new_exit_order(exchange, position, tick, target_price, 999, strategy_name="auto_profit_taking_reverse")
+
+    def _detect_trend(self, prices: List[float]) -> Dict:
+        """简易线性回归 (复制自 Strategy 以避免循环引用)"""
+        x = np.arange(len(prices))
+        slope, intercept, r_value, p_value, std_err = linregress(x, prices)
+        r_squared = r_value ** 2
+        
+        if abs(slope) < 0.1: trend = "平滑"
+        elif slope > 0.1: trend = "上升"
+        else: trend = "下降"
+        
+        # 简化的置信度计算
+        confidence = r_squared
+        if len(prices) < 5: confidence *= 0.5
+        
+        return {"trend": trend, "confidence": confidence}
 
     def _get_minutes_to_close(self, delivery_start: Union[str, datetime], current_time: datetime) -> float:
         try:
@@ -128,8 +244,6 @@ class PureExitManager:
         计算目标平仓价格
         """
         entry_price = position.avg_price
-        
-        # 固定手续费缓冲 0.46
         fee_rate = self.transaction_cost 
         cost_padding = 2 * fee_rate      
         
@@ -139,7 +253,6 @@ class PureExitManager:
 
         # --- 阶段 1: 止盈阶段 ---
         if self.forbid_new_open_minutes < minutes_to_close <= 240:
-            # 使用初始建仓时间计算进度
             start_time = position.initial_entry_time if position.initial_entry_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
@@ -152,18 +265,15 @@ class PureExitManager:
                 progress = max(0.0, min(1.0, progress))
             
             start_margin = 0.50 if entry_price < 50 else 0.30
-            # start_margin = 0.50
             end_margin = 0.01
             current_margin = start_margin - (start_margin - end_margin) * progress
             
             decay_price = 0.0
             if is_long:
                 decay_price = entry_price * (1 + current_margin) + cost_padding
-                # 取优：Max(衰减价, 市场价)
                 target_price = max(decay_price, tick.price)
             else:
                 decay_price = entry_price / (1 + current_margin) - cost_padding
-                # 取优：Min(衰减价, 市场价)
                 target_price = min(decay_price, tick.price)
 
         # --- 阶段 2: 保本阶段 ---
@@ -172,15 +282,18 @@ class PureExitManager:
             if is_long: target_price = max(breakeven_price, tick.price)
             else: target_price = min(breakeven_price, tick.price)
 
-        # --- 阶段 3: 少亏阶段 ---
+        # --- 阶段 3: 少亏阶段 (更新逻辑) ---
         elif self.stop_loss_end_minutes < minutes_to_close <= self.breakeven_end_minutes:
-            loss_limit = 0.20
+            # 计算最近10个Tick的均价
+            ticks = list(self.tick_history.get(tick.contract_name, []))
+            avg_10 = sum(ticks) / len(ticks) if ticks else tick.price
+            
             if is_long:
-                stop_price = entry_price * (1 - loss_limit) + cost_padding
-                target_price = max(stop_price, tick.price)
+                # min(avg(最近10个tick), 最新tick - 0.01)
+                target_price = min(avg_10, tick.price - 0.01)
             else:
-                stop_price = entry_price * (1 + loss_limit) - cost_padding
-                target_price = min(stop_price, tick.price)
+                # max(avg(最近10个tick), 最新tick + 0.01)
+                target_price = max(avg_10, tick.price + 0.01)
 
         # --- 阶段 4: 强平阶段 ---
         elif minutes_to_close <= self.stop_loss_end_minutes:
@@ -191,31 +304,10 @@ class PureExitManager:
 
     def modify_order(self, exchange, positions: Dict[str, Position], tick: TickEvent, active_orders: List[Order]) -> bool:
         """
-        修改订单的接口占位符
-        实际调用应由 Exchange 实现
+        修改订单的接口占位符 (在Engine中被调用)
         """
-        position = positions.get(tick.contract_name)
-        if not position or abs(position.size) < 0.001:
-            return
-        now = tick.timestamp
-
-        # 获取属于本管理器的平仓单
-        existing_order = self._find_exit_order(tick.contract_name, active_orders)
-
-        minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
-
-        target_price, is_force_market = self._calculate_target_price(
-            minutes_to_close, position, tick
-        )
-        target_price = round(target_price, 2)
-
-        # 2. 定时调价 (每分钟)
-        last_update = self.last_order_update_time.get(tick.contract_name)
-        if (not last_update) or (now - last_update).total_seconds() >= 60:
-            if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
-                if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
-                    self.last_order_update_time[tick.contract_name] = now
-                    logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
+        # 注意：这里的逻辑已经集成到了 process 中，这里留空或用于简单的定时更新
+        pass
 
     def _manage_exit_order(self, exchange, position: Position, tick: TickEvent, 
                            existing_order: Optional[Order], target_price: float, 
@@ -229,41 +321,45 @@ class PureExitManager:
         if is_force_market:
             if existing_order:
                 exchange.cancel_order(existing_order.client_order_id)
-            
-            action = ActionType.SELL if position.size > 0 else ActionType.BUY
-            signal = TradeSignal(
-                timestamp=now,
-                contract_name=tick.contract_name,
-                contract_id=tick.contract_id,
-                action=action,
-                size=abs(position.size),
-                price=tick.price,
-                strategy_name="force_close_final",
-                delivery_start=tick.delivery_start,
-                open_strategy="force_close"
-            )
-            exchange.submit_order(signal)
-            logger.info(f"触发收盘前强平: {tick.contract_name} {action} @ {tick.price}")
+            self._submit_force_close(exchange, position, tick)
             return
 
         # B. 常规调整
-        
-        # 1. 数量不一致 (需要修改或新建)
         if qty_mismatch:
             new_qty = abs(position.size)
             if existing_order:
-                # 修改现有平仓单
                 if exchange.modify_order(existing_order.client_order_id, new_price=target_price, new_quantity=new_qty):
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"同步平仓单 (修改): {tick.contract_name} 数量->{new_qty}, 价格->{target_price}")
             else:
-                # 新建平仓单
                 self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close)
             return
+            
+        # 定时调价 (每分钟) - 仅在非止损模式下，因为止损模式是实时追价
+        last_update = self.last_order_update_time.get(tick.contract_name)
+        if (not last_update) or (now - last_update).total_seconds() >= 60:
+            if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
+                if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
+                    self.last_order_update_time[tick.contract_name] = now
+                    logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
 
-        
+    def _submit_force_close(self, exchange, position: Position, tick: TickEvent):
+        action = ActionType.SELL if position.size > 0 else ActionType.BUY
+        signal = TradeSignal(
+            timestamp=tick.timestamp,
+            contract_name=tick.contract_name,
+            contract_id=tick.contract_id,
+            action=action,
+            size=abs(position.size),
+            price=tick.price,
+            strategy_name="force_close_final",
+            delivery_start=tick.delivery_start,
+            open_strategy="force_close"
+        )
+        exchange.submit_order(signal)
+        logger.info(f"触发收盘前强平: {tick.contract_name} {action} @ {tick.price}")
 
-    def _submit_new_exit_order(self, exchange, position: Position, tick: TickEvent, target_price: float, minutes_to_close: float):
+    def _submit_new_exit_order(self, exchange, position: Position, tick: TickEvent, target_price: float, minutes_to_close: float, strategy_name="auto_profit_taking"):
         action = ActionType.SELL if position.size > 0 else ActionType.BUY
         signal = TradeSignal(
             timestamp=tick.timestamp,
@@ -272,7 +368,7 @@ class PureExitManager:
             action=action,
             size=abs(position.size),
             price=target_price,
-            strategy_name="auto_profit_taking", # 必须以此开头，以便 _find_exit_order 识别
+            strategy_name=strategy_name, 
             delivery_start=tick.delivery_start,
             open_strategy="profit_taking"
         )
@@ -280,17 +376,18 @@ class PureExitManager:
             self.last_order_update_time[tick.contract_name] = tick.timestamp
             logger.info(f"挂出平仓单 ({minutes_to_close:.1f}m left): {tick.contract_name} {action} {abs(position.size)}MW @ {target_price}")
 
-    def _find_exit_order(self, contract_name: str, orders: List[Order]) -> Optional[Order]:
+    def _find_exit_order(self, contract_name: str, orders: List[Order], include_all: bool = False) -> Optional[Order]:
         """
         寻找当前合约的活动平仓单
-        【关键修改】必须过滤策略名称，只获取由 ExitManager 发起的订单 (auto_profit_taking 或 force_close)
-        否则会错误地修改建仓单 (optimized_extreme_sell / super_mean_reversion_buy)
         """
         for order in orders:
             if order.contract_name == contract_name:
                 if order.state in ["NEW", "PARTIALLY_FILLED"]:
-                    # 检查策略名称前缀
-                    # 我们的平仓策略名通常是 "auto_profit_taking", "auto_profit_taking_update", "auto_profit_taking_sync", "force_close_final"
-                    if order.strategy.startswith("auto_profit_taking") or order.strategy.startswith("force_close"):
+                    if include_all:
+                        return order
+                    # 识别所有本管理器相关的策略名
+                    if (order.strategy.startswith("auto_profit") or 
+                        order.strategy.startswith("force_close") or 
+                        order.strategy == "consecutive_loss_stop"):
                         return order
         return None

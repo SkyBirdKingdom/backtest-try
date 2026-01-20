@@ -113,6 +113,7 @@ class Position:
     # --- 【新增】实盘逻辑状态字段 ---
     has_triggered_2nd_add: bool = False  # 是否触发过二次加仓 (严格模式止损依据)
     has_reversed: bool = False           # 是否已经执行过反手 (防止反复反手)
+    stop_loss_triggered: bool = False    # 【关键】标记该持仓是否已触发止损逻辑(交给ExitManager接管)
 
 @dataclass
 class AccountInfo:

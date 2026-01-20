@@ -93,7 +93,6 @@ class PureStrategyEngine:
         # 1. 自动检测日期变更 (兜底)
         tick_date = tick.timestamp.strftime("%Y-%m-%d")
         if self.current_date != tick_date:
-            # 注意：Engine 通常会先调用 on_new_day，这里只是双重保险
             self.current_date = tick_date
             
         # 2. 【核心】实时合成 K 线 (1分钟 Bar)
@@ -104,24 +103,29 @@ class PureStrategyEngine:
             logger.info(f"💓 策略运行中... DailyPnL: {self.daily_realized_pnl:.2f} (Limit: -{self.daily_loss_limit})")
 
         # 4. 全局日内风控检查
-        
         contract_bars = self.bars[tick.contract_name]
+        
+        # 收集本 Tick 产生的所有信号
+        raw_signals = []
 
-        # --- 【新增】插入：连续亏损止损策略检查 ---
-        stop_loss_signals = []
+        # --- A. 连续亏损止损策略 & 反手 ---
+        # 检查是否触发止损，如果有信号，加入列表（不return，不阻塞后续开仓逻辑）
         position = positions.get(tick.contract_name)
         if position and abs(position.size) > 0.001:
-            sl_sig = self._check_consecutive_loss_stop_loss(tick, position, contract_bars)
-            if sl_sig:
-                # 如果触发止损，直接返回，不再计算开仓信号
-                return sl_sig
+            sl_signals = self._check_consecutive_loss_stop_loss(tick, position, contract_bars, active_orders)
+            if sl_signals:
+                raw_signals.extend(sl_signals)
 
-        # 5. 调用原有的 calculate_signals
-        signals = self.calculate_signals(tick, contract_bars, positions, active_orders, tick.timestamp, self.daily_realized_pnl)
+        # --- B. 调用原有的 calculate_signals (常规开仓/加仓逻辑) ---
+        # 即使触发了止损，这里依然执行，因为“开仓除了不能在禁止开仓时间段触发，其他时间段是不受限制的”
+        # calculate_signals 内部已经包含了 _check_time_to_close (禁止开仓时间) 的检查
+        normal_signals = self.calculate_signals(tick, contract_bars, positions, active_orders, tick.timestamp, self.daily_realized_pnl)
+        if normal_signals:
+            raw_signals.extend(normal_signals)
 
-        # 4. 合并与生产环境约束检查
+        # 5. 合并与生产环境约束检查
         final_signals = []
-        for sig in signals:
+        for sig in raw_signals:
             if not sig.is_valid:
                 final_signals.append(sig)
                 continue
@@ -192,14 +196,15 @@ class PureStrategyEngine:
         else:
             return (current_price - avg_price) / avg_price
 
-    def _check_consecutive_loss_stop_loss(self, tick: TickEvent, position: Position, bars: List[dict]) -> List[TradeSignal]:
+    def _check_consecutive_loss_stop_loss(self, tick: TickEvent, position: Position, bars: List[dict], active_orders: List[Order]) -> List[TradeSignal]:
         contract_name = tick.contract_name
         
-        # 1. 时间窗口检查
+        # 1. 【修改】时间窗口检查: 收盘前4小时 ~ 禁止开仓时间
         minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
         actual_forbid_minutes = self.forbid_new_open_minutes
-        # 如果太临近关闸，交由 ExitManager 处理，这里不再干预
-        if minutes_to_close <= actual_forbid_minutes:
+        
+        # 窗口：240分钟 >= 剩余时间 > 禁止时间
+        if not (actual_forbid_minutes < minutes_to_close <= 240):
             return []
 
         # 2. 获取最新完成的 1分钟K线
@@ -207,6 +212,7 @@ class PureStrategyEngine:
             return []
             
         tick_minute = tick.timestamp.replace(second=0, microsecond=0)
+        # 获取上一根已完成的 bar (用于判断亏损)
         last_bar = bars[-2] if bars[-1].start_time == tick_minute else bars[-1]
         
         # 亏损计算
@@ -218,106 +224,119 @@ class PureStrategyEngine:
             current_loss_ratio = (market_price - position.avg_price) / position.avg_price
             
         # 亏损阈值设定
-        if abs(position.avg_price) >= 50:
-            loss_threshold = self.high_price_profit_multiplier - 1.1 # 约 1.02-1.1 = -0.08? 需确认业务逻辑，这里沿用原代码
-            # 注意：原代码 multiplier=1.02, 这里 -1.1 结果是负数。
-            # 假设业务意图是：如果亏损超过 X%
-            # 这里我们简化逻辑：如果 PnL < 0
-            is_losing = current_loss_ratio > 0 
-        else:
-            # 原逻辑：low_price_profit_multiplier = 1.05
-            is_losing = current_loss_ratio > 0
+        is_losing = current_loss_ratio > 0
+
+        stop_triggered = False
 
         # --- 分支 A：严格模式 (Strict Mode) ---
         # 条件：该合约触发过二次加仓 (has_triggered_2nd_add) 且 当前亏损
         if position.has_triggered_2nd_add and is_losing:
             logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且亏损 ({current_loss_ratio:.2%})，立即止损!")
-            return self._create_stop_and_reverse_signals(tick, position, market_price)
+            stop_triggered = True
 
         # --- 分支 B：普通模式 (Normal Mode) ---
         # 条件：连续 10 根 K 线满足亏损条件
         
-        # 检查 K 线是否更新
-        unique_bar_id = f"{contract_name}_{last_bar['start_time']}"
+        if not stop_triggered:
+            # 检查 K 线是否更新
+            unique_bar_id = f"{contract_name}_{last_bar['start_time']}"
+            
+            if unique_bar_id not in self.processed_market_data_ids:
+                self.processed_market_data_ids.add(unique_bar_id)
+                
+                # 检测持仓均价变化 (如手动干预或加仓)，重置计数
+                prev_avg = self.last_position_avg_price.get(contract_name, position.avg_price)
+                if abs(position.avg_price - prev_avg) > 1e-6:
+                    self.consecutive_loss_count[contract_name] = 0
+                    logger.info(f"[{contract_name}] 持仓均价变化，重置止损计数")
+                self.last_position_avg_price[contract_name] = position.avg_price
+
+                # 计数逻辑
+                threshold = 0.001 
+                
+                if current_loss_ratio > threshold:
+                    self.consecutive_loss_count[contract_name] += 1
+                    logger.debug(f"[{contract_name}] 连续亏损计数: {self.consecutive_loss_count[contract_name]}/10")
+                else:
+                    if self.consecutive_loss_count[contract_name] > 0:
+                        self.consecutive_loss_count[contract_name] = 0 # 归零
+                        logger.debug(f"[{contract_name}] 出现盈利K线，计数重置")
+
+            # 触发判断
+            if self.consecutive_loss_count[contract_name] >= 10:
+                logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损，触发止损!")
+                stop_triggered = True
         
-        if unique_bar_id not in self.processed_market_data_ids:
-            self.processed_market_data_ids.add(unique_bar_id)
+        if stop_triggered:
+            # 【核心】设置标志位，通知 ExitManager 接管 (不撤销订单，而是由 ExitManager 修改)
+            position.stop_loss_triggered = True
             
-            # 检测持仓均价变化 (如手动干预或加仓)，重置计数
-            prev_avg = self.last_position_avg_price.get(contract_name, position.avg_price)
-            if abs(position.avg_price - prev_avg) > 1e-6:
-                self.consecutive_loss_count[contract_name] = 0
-                logger.info(f"[{contract_name}] 持仓均价变化，重置止损计数")
-            self.last_position_avg_price[contract_name] = position.avg_price
-
-            # 计数逻辑
-            # 这里定义 "满足亏损条件"：例如亏损超过 0.5% 或仅仅是亏损
-            # 根据需求："10个连续K线数据满足亏损条件...不连续就会重置"
-            
-            # 定义具体的亏损阈值 (这里假设只要亏损就算)
-            threshold = 0.001 # 微小亏损即可
-            
-            if current_loss_ratio > threshold:
-                self.consecutive_loss_count[contract_name] += 1
-                logger.debug(f"[{contract_name}] 连续亏损计数: {self.consecutive_loss_count[contract_name]}/10")
-            else:
-                if self.consecutive_loss_count[contract_name] > 0:
-                    self.consecutive_loss_count[contract_name] = 0 # 归零
-                    logger.debug(f"[{contract_name}] 出现盈利K线，计数重置")
-
-        # 触发判断
-        if self.consecutive_loss_count[contract_name] >= 10:
-             logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损，触发止损!")
-             return self._create_stop_and_reverse_signals(tick, position, market_price)
+            # 生成信号
+            return self._create_stop_and_reverse_signals(tick, position, market_price, active_orders, bars)
              
         return []
     
-    def _create_stop_and_reverse_signals(self, tick: TickEvent, position: Position, market_price: float) -> List[TradeSignal]:
+    def _create_stop_and_reverse_signals(self, tick: TickEvent, position: Position, market_price: float, active_orders: List[Order], bars: List[dict]) -> List[TradeSignal]:
         signals = []
         
-        # 1. 生成止损信号 (Stop Loss)
-        action = ActionType.SELL if position.size > 0 else ActionType.BUY
-        stop_signal = TradeSignal(
-            timestamp=tick.timestamp,
-            contract_name=tick.contract_name,
-            contract_id=tick.contract_id,
-            action=action,
-            size=abs(position.size),
-            # 【关键】止损单价格：初始使用当前 Tick 价格
-            # 后续如果未成交，ExitManager 会负责改价追单
-            price=market_price, 
-            strategy_name="consecutive_loss_stop", # 特定策略名，ExitManager 识别此名进行改价
-            delivery_start=tick.delivery_start,
-            confidence=1.0,
-            open_strategy=position.strategy_name,
-            failure_reason="StopLoss Triggered" 
-        )
-        signals.append(stop_signal)
+        # 1. 检查是否已有平仓单 (止盈单或止损单)
+        existing_exit_order = None
+        for order in active_orders:
+            if order.contract_name == tick.contract_name and \
+               (order.strategy.startswith("auto_profit") or order.strategy == "consecutive_loss_stop"):
+                existing_exit_order = order
+                break
         
-        # 2. 生成反手信号 (Reverse Strategy)
+        # 2. 如果没有现存的平仓单，则生成一个新的止损单
+        # 如果有，我们**不**生成新信号，而是依靠 ExitManager 检测 position.stop_loss_triggered 标志来修改现有订单
+        if not existing_exit_order:
+            action = ActionType.SELL if position.size > 0 else ActionType.BUY
+            stop_signal = TradeSignal(
+                timestamp=tick.timestamp,
+                contract_name=tick.contract_name,
+                contract_id=tick.contract_id,
+                action=action,
+                size=abs(position.size),
+                price=tick.price, # 初始价格，ExitManager 会马上接管并修改
+                strategy_name="consecutive_loss_stop", 
+                delivery_start=tick.delivery_start,
+                confidence=1.0,
+                open_strategy=position.strategy_name,
+                failure_reason="StopLoss Triggered" 
+            )
+            signals.append(stop_signal)
+            logger.info(f"[{tick.contract_name}] 生成新的止损信号")
+
+        # 3. 生成反手信号 (Reverse Strategy)
         # 检查是否已反手 (One-shot Check)
         if not position.has_reversed:
             reverse_action = ActionType.SELL if position.size > 0 else ActionType.BUY
-            # 反手策略逻辑：顺势而为 (即与平仓方向一致)
+            # 【修改】反手数量：当前持仓量
+            reverse_size = abs(position.size)
             
-            # 计算反手数量：需求未明确，这里假设开 0.5 倍标准手或固定值
-            reverse_size = max(0.1, round(self.default_contract_max_position / 2, 1))
-            
+            # 【修改】反手价格：前一个 Bar 的价格
+            prev_bar_price = tick.price
+            if len(bars) >= 2:
+                # bars[-1] 是当前正在合成的，bars[-2] 是上一根归档的
+                prev_bar_price = bars[-2]['close']
+            elif len(bars) == 1:
+                prev_bar_price = bars[-1]['open'] # 退化处理
+
             reverse_signal = TradeSignal(
                 timestamp=tick.timestamp,
                 contract_name=tick.contract_name,
                 contract_id=tick.contract_id,
                 action=reverse_action,
                 size=reverse_size,
-                price=tick.price, # 反手单：固定价格，不追价
+                price=prev_bar_price, 
                 strategy_name="trend_reversal_after_stop", # 策略名
                 delivery_start=tick.delivery_start,
                 confidence=0.8,
-                open_strategy="trend_reversal",
+                open_strategy="trend_reversal", # 标记开仓策略
                 trend_info="Reverse after Stop"
             )
             signals.append(reverse_signal)
-            logger.info(f"[{tick.contract_name}] 生成反手信号 (Size: {reverse_size})")
+            logger.info(f"[{tick.contract_name}] 生成反手信号 (Size: {reverse_size}, Price: {prev_bar_price})")
             
         return signals
 
@@ -387,8 +406,8 @@ class PureStrategyEngine:
         1. 订单互斥：存在同合约同方向的"活跃开仓单"时，禁止发新单
         2. 信号抑制：5秒内同合约同方向抑制
         """
-        if signal.strategy_name == "consecutive_loss_stop":
-            return True  # 止损单不受此限制
+        if signal.strategy_name == "consecutive_loss_stop" or signal.strategy_name == "trend_reversal_after_stop":
+            return True  # 止损/反手单不受此限制
         # 1. 订单开仓限制
         for order in active_orders:
             if order.contract_name == signal.contract_name:

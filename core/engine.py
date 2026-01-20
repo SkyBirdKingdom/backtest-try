@@ -100,11 +100,13 @@ class BacktestEngine:
                     self.bars_memory[tick.contract_name].pop(0)
 
             # 4. 策略层：执行平仓管理
+            # 【核心修改】传入 bars_memory 供 ExitManager 计算反手趋势
             self.exit_manager.process(
                 tick, 
                 self.exchange.positions, 
                 self.exchange.active_orders,
-                self.exchange
+                self.exchange,
+                bars=self.bars_memory.get(tick.contract_name, [])
             )
             
             # 5. 策略层：生成交易信号
