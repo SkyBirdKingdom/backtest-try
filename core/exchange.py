@@ -190,7 +190,7 @@ class VirtualExchange:
 
     def _check_order_timeout(self):
         for order in list(self.active_orders):
-            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking" or order.strategy.startswith("force_close") or order.strategy == "consecutive_loss_stop":
+            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking" or order.strategy.startswith("force_close") or order.strategy.startswith("stop_loss"):
                 continue
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
@@ -314,7 +314,8 @@ class VirtualExchange:
                 delivery_start=order.delivery_start,
                 strategy_name=order.strategy,
                 open_strategy=order.open_strategy,
-                initial_entry_time=self.current_time 
+                initial_entry_time=self.current_time,
+                involved_order_ids=set() # 初始化为空集合
             )
             self.positions[key] = pos
 
@@ -335,12 +336,13 @@ class VirtualExchange:
             if "reversal" in order.strategy:
                 pos.has_reversed = True
 
-        # 2. 【核心】检测二次加仓 (用于严格模式止损)
-        # 如果是加仓行为，且当前不是空仓，且不是反手
-        if is_increase and old_size != 0 and not is_reversal:
-            # 这里简单处理：只要发生过加仓，就认为触发了
-            pos.has_triggered_2nd_add = True
-            logger.info(f"[{key}] 触发加仓标记 (Old: {old_size} -> New: {new_size})")
+        # 2. 【核心修改】检测二次加仓 (Strict Mode 依据)
+        # 逻辑：只有当持仓增加，且当前订单ID之前没记录过（是新订单），才算二次加仓
+        # 排除同一个订单分批成交导致的 size 增加
+        if is_increase and abs(old_size) > 0.001 and not is_reversal:
+            if order.client_order_id not in pos.involved_order_ids:
+                pos.has_triggered_2nd_add = True
+                logger.info(f"[{key}] 触发二次加仓标记 (New Order: {order.client_order_id})")
             
         # 3. 成本计算 (加权平均)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):

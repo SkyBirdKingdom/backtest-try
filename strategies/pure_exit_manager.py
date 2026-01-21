@@ -126,11 +126,11 @@ class PureExitManager:
         else:
             is_force_market = False
             
-        # 查找现有订单 (任意类型的平仓单：auto_profit 或 consecutive_loss_stop)
+        # 查找现有订单 (任意类型的平仓单：auto_profit 或 consecutive_loss_stop 或 trend_reversal)
         existing_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy == "consecutive_loss_stop" or order.strategy.startswith("trend_reversal")):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
                 existing_order = order
                 break
         
@@ -388,6 +388,6 @@ class PureExitManager:
                     # 识别所有本管理器相关的策略名
                     if (order.strategy.startswith("auto_profit") or 
                         order.strategy.startswith("force_close") or 
-                        order.strategy == "consecutive_loss_stop"):
+                        order.strategy.startswith("stop_loss")):
                         return order
         return None

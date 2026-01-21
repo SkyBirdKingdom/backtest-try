@@ -230,12 +230,14 @@ class PureStrategyEngine:
         is_losing = current_loss_ratio > 0
 
         stop_triggered = False
+        trigger_mode = "" # 用于记录触发模式
 
         # --- 分支 A：严格模式 (Strict Mode) ---
         # 条件：该合约触发过二次加仓 (has_triggered_2nd_add) 且 当前亏损
         if position.has_triggered_2nd_add and is_losing:
             logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且亏损 ({current_loss_ratio:.2%})，立即止损!")
             stop_triggered = True
+            trigger_mode = "Strict"
 
         # --- 分支 B：普通模式 (Normal Mode) ---
         # 条件：连续 10 根 K 线满足亏损条件
@@ -269,24 +271,25 @@ class PureStrategyEngine:
             if self.consecutive_loss_count[contract_name] >= 10:
                 logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损，触发止损!")
                 stop_triggered = True
+                trigger_mode = "Normal"
         
         if stop_triggered:
             # 【核心】设置标志位，通知 ExitManager 接管 (不撤销订单，而是由 ExitManager 修改)
             position.stop_loss_triggered = True
             
             # 生成信号
-            return self._create_stop_and_reverse_signals(tick, position, market_price, active_orders, bars)
+            return self._create_stop_and_reverse_signals(tick, position, market_price, active_orders, bars, trigger_mode)
              
         return []
     
-    def _create_stop_and_reverse_signals(self, tick: TickEvent, position: Position, market_price: float, active_orders: List[Order], bars: List[dict]) -> List[TradeSignal]:
+    def _create_stop_and_reverse_signals(self, tick: TickEvent, position: Position, market_price: float, active_orders: List[Order], bars: List[dict], trigger_mode: str) -> List[TradeSignal]:
         signals = []
         
         # 1. 检查是否已有平仓单 (止盈单或止损单)
         existing_exit_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy == "consecutive_loss_stop"):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("stop_loss")):
                 existing_exit_order = order
                 break
         
@@ -294,6 +297,9 @@ class PureStrategyEngine:
         # 如果有，我们**不**生成新信号，而是依靠 ExitManager 检测 position.stop_loss_triggered 标志来修改现有订单
         if not existing_exit_order:
             action = ActionType.SELL if position.size > 0 else ActionType.BUY
+            # 策略名加上模式后缀，如 consecutive_loss_stop_strict
+            stop_strategy_name = f"stop_loss_{trigger_mode.lower()}"
+
             stop_signal = TradeSignal(
                 timestamp=tick.timestamp,
                 contract_name=tick.contract_name,
@@ -301,14 +307,14 @@ class PureStrategyEngine:
                 action=action,
                 size=abs(position.size),
                 price=tick.price, # 初始价格，ExitManager 会马上接管并修改
-                strategy_name="consecutive_loss_stop", 
+                strategy_name=stop_strategy_name, 
                 delivery_start=tick.delivery_start,
                 confidence=1.0,
                 open_strategy=position.strategy_name,
                 failure_reason="StopLoss Triggered" 
             )
             signals.append(stop_signal)
-            logger.info(f"[{tick.contract_name}] 生成新的止损信号")
+            logger.info(f"[{tick.contract_name}] 生成新的止损信号(Mode: {trigger_mode})")
 
         # 3. 生成反手信号 (Reverse Strategy)
         # 检查是否已反手 (One-shot Check)
@@ -324,6 +330,9 @@ class PureStrategyEngine:
                 prev_bar_price = bars[-2]['close']
             elif len(bars) == 1:
                 prev_bar_price = bars[-1]['open'] # 退化处理
+            
+            # 策略名加上模式后缀，如 trend_reversal_strict
+            reverse_strategy_name = f"trend_reversal_{trigger_mode.lower()}"
 
             reverse_signal = TradeSignal(
                 timestamp=tick.timestamp,
@@ -332,7 +341,7 @@ class PureStrategyEngine:
                 action=reverse_action,
                 size=reverse_size,
                 price=prev_bar_price, 
-                strategy_name="trend_reversal_after_stop", # 策略名
+                strategy_name=reverse_strategy_name, # 策略名
                 delivery_start=tick.delivery_start,
                 confidence=0.8,
                 open_strategy="trend_reversal", # 标记开仓策略
@@ -342,7 +351,7 @@ class PureStrategyEngine:
             # --- 【新增】立即记录该合约已反手 ---
             self.executed_reverse_strategies.add(tick.contract_name)
             # ----------------------------------
-            logger.info(f"[{tick.contract_name}] 生成反手信号 (Size: {reverse_size}, Price: {prev_bar_price})")
+            logger.info(f"[{tick.contract_name}] 生成反手信号 (Mode: {trigger_mode}, Size: {reverse_size}, Price: {prev_bar_price})")
             
         return signals
 
@@ -412,7 +421,7 @@ class PureStrategyEngine:
         1. 订单互斥：存在同合约同方向的"活跃开仓单"时，禁止发新单
         2. 信号抑制：5秒内同合约同方向抑制
         """
-        if signal.strategy_name == "consecutive_loss_stop" or signal.strategy_name == "trend_reversal_after_stop":
+        if signal.strategy_name.startswith("stop_loss") or signal.strategy_name.startswith("trend_reversal"):
             return True  # 止损/反手单不受此限制
         # 1. 订单开仓限制
         for order in active_orders:
