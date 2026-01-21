@@ -383,8 +383,8 @@ class PureExitManager:
         for order in orders:
             if order.contract_name == contract_name:
                 if order.state in ["NEW", "PARTIALLY_FILLED"]:
-                    if include_all:
-                        return order
+                    # if include_all:
+                    #     return order
                     # 识别所有本管理器相关的策略名
                     if (order.strategy.startswith("auto_profit") or 
                         order.strategy.startswith("force_close") or 
