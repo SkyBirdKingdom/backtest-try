@@ -213,15 +213,11 @@ class PureStrategyEngine:
             
         tick_minute = tick.timestamp.replace(second=0, microsecond=0)
         # 获取上一根已完成的 bar (用于判断亏损)
-        last_bar = bars[-2] if bars[-1].start_time == tick_minute else bars[-1]
+        last_bar = bars[-2] if bars[-1]['start_time'] == tick_minute else bars[-1]
         
         # 亏损计算
         market_price = last_bar['avg_price'] # 使用K线均价作为基准
-        current_loss_ratio = 0.0
-        if position.size > 0: # 多头
-            current_loss_ratio = (position.avg_price - market_price) / position.avg_price
-        else: # 空头
-            current_loss_ratio = (market_price - position.avg_price) / position.avg_price
+        current_loss_ratio = self.get_loss_ratio(position.size, position.avg_price, market_price)
             
         # 亏损阈值设定
         is_losing = current_loss_ratio > 0

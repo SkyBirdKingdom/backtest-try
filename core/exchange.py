@@ -313,6 +313,7 @@ class VirtualExchange:
                 timestamp=self.current_time,
                 delivery_start=order.delivery_start,
                 strategy_name=order.strategy,
+                open_strategy=order.open_strategy,
                 initial_entry_time=self.current_time 
             )
             self.positions[key] = pos
@@ -351,6 +352,7 @@ class VirtualExchange:
             # 只有当持仓反转或从0开始时才更新策略名，加仓不改变主要策略名
             if old_size == 0 or is_reversal:
                 pos.strategy_name = order.strategy 
+                pos.open_strategy = order.open_strategy
             
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
             # 减仓 or 平仓

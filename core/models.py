@@ -107,6 +107,8 @@ class Position:
     timestamp: datetime
     delivery_start: datetime
     strategy_name: str = ""
+    # 【新增】👇 必须补上这个字段，否则 ExitManager 会报错
+    open_strategy: str = ""
     # 【新增】初始建仓时间，用于计算动态止盈的衰减起点
     initial_entry_time: Optional[datetime] = None
 
