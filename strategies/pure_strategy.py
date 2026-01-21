@@ -115,6 +115,13 @@ class PureStrategyEngine:
             sl_signals = self._check_consecutive_loss_stop_loss(tick, position, contract_bars, active_orders)
             if sl_signals:
                 raw_signals.extend(sl_signals)
+        
+        # --- 【新增】反手后封锁逻辑 ---
+        # 如果该合约已经触发过反手策略，禁止后续一切常规开仓/加仓
+        if tick.contract_name in self.executed_reverse_strategies:
+            # 仅允许上面的止损/平仓逻辑运行，直接跳过下面的 calculate_signals
+            return raw_signals
+        # ---------------------------
 
         # --- B. 调用原有的 calculate_signals (常规开仓/加仓逻辑) ---
         # 即使触发了止损，这里依然执行，因为“开仓除了不能在禁止开仓时间段触发，其他时间段是不受限制的”
@@ -305,7 +312,7 @@ class PureStrategyEngine:
 
         # 3. 生成反手信号 (Reverse Strategy)
         # 检查是否已反手 (One-shot Check)
-        if not position.has_reversed:
+        if tick.contract_name not in self.executed_reverse_strategies:
             reverse_action = ActionType.SELL if position.size > 0 else ActionType.BUY
             # 【修改】反手数量：当前持仓量
             reverse_size = abs(position.size)
@@ -332,6 +339,9 @@ class PureStrategyEngine:
                 trend_info="Reverse after Stop"
             )
             signals.append(reverse_signal)
+            # --- 【新增】立即记录该合约已反手 ---
+            self.executed_reverse_strategies.add(tick.contract_name)
+            # ----------------------------------
             logger.info(f"[{tick.contract_name}] 生成反手信号 (Size: {reverse_size}, Price: {prev_bar_price})")
             
         return signals
