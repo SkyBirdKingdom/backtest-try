@@ -130,7 +130,7 @@ class PureExitManager:
         existing_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
                 existing_order = order
                 break
         
@@ -253,7 +253,7 @@ class PureExitManager:
 
         # --- 阶段 1: 止盈阶段 ---
         if self.forbid_new_open_minutes < minutes_to_close <= 240:
-            start_time = position.initial_entry_time if position.initial_entry_time else position.timestamp
+            start_time = position.last_size_change_time if position.last_size_change_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
             if start_minutes_to_close <= self.take_profit_end_minutes:
@@ -261,7 +261,10 @@ class PureExitManager:
             else:
                 total_duration = start_minutes_to_close - self.take_profit_end_minutes
                 elapsed = start_minutes_to_close - minutes_to_close
-                progress = elapsed / total_duration
+                if total_duration <= 0.001:
+                    progress = 1.0
+                else:
+                    progress = elapsed / total_duration
                 progress = max(0.0, min(1.0, progress))
             
             start_margin = 0.50 if entry_price < 50 else 0.30
@@ -271,9 +274,14 @@ class PureExitManager:
             decay_price = 0.0
             if is_long:
                 decay_price = entry_price * (1 + current_margin) + cost_padding
+                if entry_price < 0:
+                    decay_price = entry_price + abs(entry_price) * current_margin + cost_padding
+                
                 target_price = max(decay_price, tick.price)
             else:
                 decay_price = entry_price / (1 + current_margin) - cost_padding
+                if entry_price < 0:
+                    decay_price = entry_price - abs(entry_price) * current_margin - cost_padding
                 target_price = min(decay_price, tick.price)
 
         # --- 阶段 2: 保本阶段 ---

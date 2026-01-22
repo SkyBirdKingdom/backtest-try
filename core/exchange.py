@@ -315,6 +315,7 @@ class VirtualExchange:
                 strategy_name=order.strategy,
                 open_strategy=order.open_strategy,
                 initial_entry_time=self.current_time,
+                last_size_change_time=self.current_time, # 初始化
                 involved_order_ids=set() # 初始化为空集合
             )
             self.positions[key] = pos
@@ -322,6 +323,11 @@ class VirtualExchange:
         pos = self.positions[key]
         old_size = pos.size
         new_size = round(old_size + size_delta, 1) 
+
+        # --- 【新增】检测仓位变化，更新最后变动时间 ---
+        if abs(new_size - old_size) > 0.001:
+            pos.last_size_change_time = self.current_time
+        # ----------------------------------------
         
         is_increase = abs(new_size) > abs(old_size)
         is_reversal = (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0)
@@ -329,9 +335,11 @@ class VirtualExchange:
         # 1. 初始建仓时间
         if is_reversal or (old_size == 0 and abs(new_size) > 0):
             pos.initial_entry_time = self.current_time
+            pos.last_size_change_time = self.current_time
             # 反手时，重置所有状态
             pos.has_triggered_2nd_add = False
             pos.has_reversed = False 
+            pos.stop_loss_triggered = False
             # 如果这是一个反手策略的成交，标记它已经反手过了
             if "reversal" in order.strategy:
                 pos.has_reversed = True
