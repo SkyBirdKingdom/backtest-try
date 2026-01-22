@@ -328,29 +328,39 @@ class PureStrategyEngine:
 
         # 3. 生成反手信号 (Reverse Strategy)
         # 检查是否已反手 (One-shot Check)
-        if tick.contract_name not in self.executed_reverse_strategies:
-            reverse_action = ActionType.SELL if position.size > 0 else ActionType.BUY
-            # 【修改】反手数量：当前持仓量
-            reverse_size = abs(position.size)
-            
-            # 策略名加上模式后缀，如 trend_reversal_strict
-            reverse_strategy_name = f"trend_reversal_{trigger_mode.lower()}"
+        if tick.contract_name in self.executed_reverse_strategies:
+            return signals
+        
+        # 检查 B: 【新增】是否已有“正在挂单中”的反手单 (防止成交前重复发单)
+        # 我们遍历 active_orders，看有没有 strategy 名字里带 "trend_reversal" 的
+        for order in active_orders:
+            if order.contract_name == tick.contract_name and order.strategy.startswith("trend_reversal"):
+                # 如果已经有挂着的反手单，直接返回，不再生成新信号
+                logger.info(f"[{tick.contract_name}] 忽略反手信号：已存在活动的反手单 ({order.client_order_id})")
+                return signals
+        
+        reverse_action = ActionType.SELL if position.size > 0 else ActionType.BUY
+        # 【修改】反手数量：当前持仓量
+        reverse_size = abs(position.size)
+        
+        # 策略名加上模式后缀，如 trend_reversal_strict
+        reverse_strategy_name = f"trend_reversal_{trigger_mode.lower()}"
 
-            reverse_signal = TradeSignal(
-                timestamp=tick.timestamp,
-                contract_name=tick.contract_name,
-                contract_id=tick.contract_id,
-                action=reverse_action,
-                size=reverse_size,
-                price=tick.price, 
-                strategy_name=reverse_strategy_name, # 策略名
-                delivery_start=tick.delivery_start,
-                confidence=0.8,
-                open_strategy="trend_reversal", # 标记开仓策略
-                trend_info="Reverse after Stop"
-            )
-            signals.append(reverse_signal)
-            logger.info(f"[{tick.contract_name}] 生成反手信号 (Mode: {trigger_mode}, Size: {reverse_size}, Price: {tick.price})")
+        reverse_signal = TradeSignal(
+            timestamp=tick.timestamp,
+            contract_name=tick.contract_name,
+            contract_id=tick.contract_id,
+            action=reverse_action,
+            size=reverse_size,
+            price=tick.price, 
+            strategy_name=reverse_strategy_name, # 策略名
+            delivery_start=tick.delivery_start,
+            confidence=0.8,
+            open_strategy="trend_reversal", # 标记开仓策略
+            trend_info="Reverse after Stop"
+        )
+        signals.append(reverse_signal)
+        logger.info(f"[{tick.contract_name}] 生成反手信号 (Mode: {trigger_mode}, Size: {reverse_size}, Price: {tick.price})")
             
         return signals
 

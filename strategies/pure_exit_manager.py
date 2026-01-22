@@ -324,6 +324,19 @@ class PureExitManager:
         
         now = tick.timestamp
         target_price = round(target_price, 2)
+
+        # --- 【新增】确定当前的平仓策略标签 ---
+        current_strategy_name = "auto_exit_unknown"
+        if is_force_market:
+            current_strategy_name = "exit_force_close"
+        elif self.forbid_new_open_minutes < minutes_to_close <= 240:
+            current_strategy_name = "exit_take_profit" # 止盈阶段
+        elif self.breakeven_end_minutes < minutes_to_close <= self.take_profit_end_minutes:
+            current_strategy_name = "exit_breakeven"   # 保本阶段
+        elif self.stop_loss_end_minutes < minutes_to_close <= self.breakeven_end_minutes:
+            current_strategy_name = "exit_reduce_loss" # 少亏阶段
+        else:
+            current_strategy_name = "exit_force_close" # 兜底
         
         # A. 强平阶段
         if is_force_market:
@@ -340,7 +353,7 @@ class PureExitManager:
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"同步平仓单 (修改): {tick.contract_name} 数量->{new_qty}, 价格->{target_price}")
             else:
-                self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close)
+                self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name=current_strategy_name)
             return
             
         # 定时调价 (每分钟) - 仅在非止损模式下，因为止损模式是实时追价
@@ -350,6 +363,8 @@ class PureExitManager:
                 if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
+            else:
+                self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name=current_strategy_name)
 
     def _submit_force_close(self, exchange, position: Position, tick: TickEvent):
         action = ActionType.SELL if position.size > 0 else ActionType.BUY
