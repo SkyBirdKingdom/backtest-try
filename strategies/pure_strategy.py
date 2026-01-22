@@ -193,15 +193,36 @@ class PureStrategyEngine:
         delta = gate_closure - current_time
         return delta.total_seconds() / 60.0
 
-    def get_loss_ratio(self, size: float, avg_price: float, current_price: float) -> float:
-        """计算亏损率"""
-        if avg_price == 0: return 0.0
-        # 多头: (成本 - 现价) / 成本 -> 正数表示亏损
-        if size > 0:
-            return (avg_price - current_price) / avg_price
-        # 空头: (现价 - 成本) / 成本
+    def get_loss_ratio(self, position_size, avg_price, current_price):
+        """
+        通用亏损率计算方法（支持负价格）
+
+        参数:
+        :param position_size: 持仓数量 (正数为多头, 负数为空头)
+        :param avg_price: 持仓均价 (可能为负)
+        :param current_price: 当前市场价 (可能为负)
+
+        返回:
+        :return: float, 亏损率 (例如 0.2 表示亏损 20%, -0.1 表示盈利 10%)
+        """
+        # 1. 安全检查：无持仓或均价为0（无法计算比例）
+        if position_size == 0 or avg_price == 0:
+            return 0.0
+
+        # 2. 计算价格差 (Price Difference)
+        # 多头 (size > 0): 价格下跌是亏损 (开仓价 - 现价)
+        # 空头 (size < 0): 价格上涨是亏损 (现价 - 开仓价)
+        if position_size > 0:
+            price_diff = avg_price - current_price
         else:
-            return (current_price - avg_price) / avg_price
+            price_diff = current_price - avg_price
+
+        # 3. 计算亏损率
+        # 核心：使用绝对值 abs(avg_price) 作为基准，
+        # 这样无论价格在正轴还是负轴，计算出的比例方向都是正确的。
+        loss_ratio = price_diff / abs(avg_price)
+
+        return float(loss_ratio)
 
     def _check_consecutive_loss_stop_loss(self, tick: TickEvent, position: Position, bars: List[dict], active_orders: List[Order]) -> List[TradeSignal]:
         contract_name = tick.contract_name
@@ -225,9 +246,11 @@ class PureStrategyEngine:
         # 亏损计算
         market_price = last_bar['avg_price'] # 使用K线均价作为基准
         current_loss_ratio = self.get_loss_ratio(position.size, position.avg_price, market_price)
+
+        loss_threshold = 0.2 if abs(position.avg_price) >= 50 else 0.5
             
         # 亏损阈值设定
-        is_losing = current_loss_ratio > 0
+        is_losing = current_loss_ratio >= loss_threshold
 
         stop_triggered = False
         trigger_mode = "" # 用于记录触发模式
