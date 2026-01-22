@@ -252,7 +252,7 @@ class PureExitManager:
         is_force_market = False
 
         # --- 阶段 1: 止盈阶段 ---
-        if self.forbid_new_open_minutes < minutes_to_close <= 240:
+        if self.take_profit_end_minutes < minutes_to_close <= 240:
             start_time = position.last_size_change_time if position.last_size_change_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
@@ -329,7 +329,7 @@ class PureExitManager:
         current_strategy_name = "auto_exit_unknown"
         if is_force_market:
             current_strategy_name = "exit_force_close"
-        elif self.forbid_new_open_minutes < minutes_to_close <= 240:
+        elif self.take_profit_end_minutes < minutes_to_close <= 240:
             current_strategy_name = "exit_take_profit" # 止盈阶段
         elif self.breakeven_end_minutes < minutes_to_close <= self.take_profit_end_minutes:
             current_strategy_name = "exit_breakeven"   # 保本阶段
@@ -410,6 +410,7 @@ class PureExitManager:
                     #     return order
                     # 识别所有本管理器相关的策略名
                     if (order.strategy.startswith("auto_profit") or 
+                        order.strategy.startswith("exit_") or
                         order.strategy.startswith("force_close") or 
                         order.strategy.startswith("stop_loss")):
                         return order

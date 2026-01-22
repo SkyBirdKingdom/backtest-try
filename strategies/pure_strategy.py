@@ -121,6 +121,7 @@ class PureStrategyEngine:
                  logger.info(f"✅ [{tick.contract_name}] 检测到反手策略持仓，标记为已执行 (不再触发反手)")
         # -------------------------------
 
+        # 控制止损和反手逻辑
         if position and abs(position.size) > 0.001:
             sl_signals = self._check_consecutive_loss_stop_loss(tick, position, contract_bars, active_orders)
             if sl_signals:
@@ -326,6 +327,7 @@ class PureStrategyEngine:
             signals.append(stop_signal)
             logger.info(f"[{tick.contract_name}] 生成新的止损信号(Mode: {trigger_mode})")
 
+        # 控制反手逻辑
         # 3. 生成反手信号 (Reverse Strategy)
         # 检查是否已反手 (One-shot Check)
         if tick.contract_name in self.executed_reverse_strategies:
