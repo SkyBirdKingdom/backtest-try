@@ -399,18 +399,6 @@ class PureStrategyEngine:
             self._apply_risk_checks(sig_ext, tick, bars, positions, current_time, current_daily_pnl)
             raw_signals.append(sig_ext)
         
-        # --- 策略 3: 高波动 ---
-        # sig_vol = self._high_volatility_dip_buy(tick, positions, current_time)
-        # if sig_vol:
-        #     self._apply_risk_checks(sig_vol, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True)
-        #     raw_signals.append(sig_vol)
-
-        # --- 策略 4: 交付时间 ---
-        # sig_del = self._delivery_time_buy_strategy(tick, positions, current_time)
-        # if sig_del:
-        #     self._apply_risk_checks(sig_del, tick, bars, positions, current_time, current_daily_pnl, skip_trend=True, skip_close_time=True)
-        #     raw_signals.append(sig_del)
-
         # =========================================================
         # 【新增】生产环境逻辑检查 (信号抑制 + 订单互斥)
         # =========================================================
@@ -515,6 +503,18 @@ class PureStrategyEngine:
     def _validate_ph_signal(self, signal: TradeSignal) -> bool:
         """验证PH信号的特定逻辑"""
         if signal.contract_name.startswith("PH"):
+            # 🛡️ 防火墙 1：平仓、止损、反手、强平类策略，跳过除以4！
+            # 它们是基于现有持仓的绝对值操作，必须精确匹配。
+            is_close_logic = (
+                signal.strategy_name.startswith("stop_loss") or 
+                signal.strategy_name.startswith("trend_reversal") or 
+                signal.strategy_name.startswith("force_close") or
+                signal.strategy_name.startswith("exit_") or
+                signal.open_strategy == "force_close" # 双重保险
+            )
+            
+            if is_close_logic:
+                return True
             original_size = signal.size
             signal.size = round(signal.size / 4, 1)  # 四舍五入到小数点后一位
             if signal.size < 0.1:
@@ -799,6 +799,10 @@ class PureStrategyEngine:
         z_score = (tick.price - mean) / std
         
         if z_score <= -threshold:
+            # 检查是否启用了动态仓位
+            if params.get('use_dynamic_sizing', False):
+                max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
             # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
             is_valid = size > 0.001
@@ -834,6 +838,10 @@ class PureStrategyEngine:
             condition = tick.price > upper and tick.price > threshold * mean
             
         if condition:
+            # 检查是否启用了动态仓位
+            if params.get('use_dynamic_sizing', False):
+                max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.SELL)
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
@@ -843,36 +851,57 @@ class PureStrategyEngine:
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Upper{percentile}:{round(upper,2)}", raw_size=size, is_valid=is_valid, failure_reason=reason)
         return None
 
-    def _high_volatility_dip_buy(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
-        strategy_name = "high_volatility_dip_buy"
-        max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
-        params = self.params.get(strategy_name, {}).copy()
-        params.update(override.get(strategy_name, {}))
-        
-        prices = self.price_history.get(tick.contract_name, [])
-        if len(prices) < 20: return None
-        
-        recent = prices[-24:]
-        vol = np.std(recent)
-        min_p = min(recent[-5:])
-        
-        if vol >= params.get('threshold', 50.0) and tick.price <= min_p:
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
-            is_valid = size > 0.001
-            reason = "" if is_valid else "Position Limit Reached (Size=0)"
-            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=0.7, open_strategy=strategy_name, std_price=round(vol,2), raw_size=size, is_valid=is_valid, failure_reason=reason)
-        return None
+    def _calculate_liquidity_based_size(self, 
+                                      tick: TickEvent, 
+                                      bars: List[dict], 
+                                      positions: Dict[str, Position],
+                                      params: Dict) -> float:
+        """
+        🌊 基于流速 (Flow Rate) 的动态开仓量计算
+        """
+        # 1. 提取参数
+        lookback = params.get('liquidity_lookback', 30)
+        rate = params.get('liquidity_participation', 0.05)
+        projection_mode = params.get('liquidity_projection', '60')
+        min_size = params.get('min_open_size', 0.1)
 
-    def _delivery_time_buy_strategy(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
-        strategy_name = "delivery_time_buy"
-        if tick.contract_name in self.delivery_time_strategy_executed: return None
-        max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
-        params = self.params.get(strategy_name, {}).copy()
-        params.update(override.get(strategy_name, {}))
-        if 'delivery_time_buy' in override:
-            self.delivery_time_strategy_executed.add(tick.contract_name)
-            size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
-            is_valid = size > 0.001
-            reason = "" if is_valid else "Position Limit Reached (Size=0)"
-            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=0.7, open_strategy=strategy_name, raw_size=size, is_valid=is_valid, failure_reason=reason)
-        return None
+        # 2. 计算流速
+        cutoff = tick.timestamp - timedelta(minutes=lookback)
+        # 过滤出最近 N 分钟的 Bar
+        recent_bars = [b for b in bars if b['start_time'] >= cutoff]
+        
+        if not recent_bars:
+            return 0.0
+
+        total_vol = sum(b['volume'] for b in recent_bars)
+        # 即使 bar 不足 30 根，也除以 30，这反映了"时间上的真实稀疏度"
+        avg_flow_rate = total_vol / lookback  # MW per minute
+
+        if projection_mode == 'till_close':
+            gate_closure = tick.delivery_start - timedelta(hours=1)
+            minutes_left = (gate_closure - tick.timestamp).total_seconds() / 60.0
+            projection_minutes = max(0, minutes_left)
+        else:
+            projection_minutes = timedelta(minutes=int(projection_mode)).total_seconds() / 60.0  # 默认 60 分钟
+
+        # 3. 预测未来容量 (默认预测 60 分钟)
+        projected_capacity = avg_flow_rate * projection_minutes
+
+        # 4. 计算目标下单量
+        target_size = projected_capacity * rate
+        target_size = round(target_size, 1)
+
+        # 5. 🛡️ 防火墙 2：全局资金/持仓硬性兜底
+        # 即使流速允许买 100MW，我们也不能超过账户允许的最大持仓
+        total_holdings = sum(abs(p.size) for p in positions.values())
+        global_avail = max(0.0, self.max_position_size - total_holdings)
+        
+        final_size = min(target_size, global_avail)
+
+        if final_size < min_size:
+            return 0.0
+            
+        # 记录一下，方便调试
+        # logger.info(f"🌊 [{tick.contract_name}] 流速: {avg_flow_rate:.2f} MW/m -> 建议: {target_size} MW")
+        
+        return final_size

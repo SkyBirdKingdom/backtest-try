@@ -70,6 +70,10 @@ def main():
             "stop_loss_end_minutes": 3,
             
             "super_mean_reversion_buy": {
+                "use_dynamic_sizing": True,      # 开启
+                "liquidity_lookback": 30,        # 看过去30分钟
+                "liquidity_participation": 0.20, # 吃掉预测量的 5%
+                "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
                 "action": "BUY",
                 "history_min_len": 10,
                 "ma_window": 5,
@@ -81,6 +85,10 @@ def main():
             },
             
             "optimized_extreme_sell": {
+                "use_dynamic_sizing": True,      # 开启
+                "liquidity_lookback": 30,        # 看过去30分钟
+                "liquidity_participation": 0.20, # 吃掉预测量的 5%
+                "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
                 "action": "SELL",
                 "history_min_len": 10,
                 "percentile_window": 5,
