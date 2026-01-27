@@ -50,7 +50,7 @@ def main():
     config = {
         "initial_capital": 40000.0,
         "min_price_for_new_position": 10.0, 
-        "max_position_size": 60.0,
+        "max_position_size": 6000.0,
         "max_contract_position_size": 4.0, # 默认值，会被 delivery_rules 覆盖
         "daily_loss_limit": 100.0,
         "transaction_cost": 0.23,

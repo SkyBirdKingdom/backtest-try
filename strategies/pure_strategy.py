@@ -73,7 +73,7 @@ class PureStrategyEngine:
         self.consecutive_loss_count.clear()
         self.last_position_avg_price.clear()
         self.processed_market_data_ids.clear()
-        self.executed_reverse_strategies.clear()
+        # self.executed_reverse_strategies.clear()
         
         # 清理过期的价格缓存
         for k in list(self.price_history.keys()):
@@ -109,9 +109,6 @@ class PureStrategyEngine:
         raw_signals = []
 
         # --- A. 连续亏损止损策略 & 反手 ---
-        # 检查是否触发止损，如果有信号，加入列表（不return，不阻塞后续开仓逻辑）
-        position = positions.get(tick.contract_name)
-
         # --- 【新增】反手状态确认逻辑 ---
         # 如果当前持仓是由反手策略建立的，标记该合约反手已成功执行
         position = positions.get(tick.contract_name)
@@ -120,6 +117,17 @@ class PureStrategyEngine:
                  self.executed_reverse_strategies.add(tick.contract_name)
                  logger.info(f"✅ [{tick.contract_name}] 检测到反手策略持仓，标记为已执行 (不再触发反手)")
         # -------------------------------
+
+        # 2. 【新增】检查挂单 (防止持仓未形成或部分成交时的遗漏)
+        # 只要反手单发生过任何成交 (remaining < quantity)，就视为反手已执行
+        if tick.contract_name not in self.executed_reverse_strategies:
+            for order in active_orders:
+                if order.contract_name == tick.contract_name and "trend_reversal" in order.strategy:
+                    # 如果有成交量 (哪怕是 0.1 MW)，就视为“反手订单发生交易”
+                    if order.remaining_quantity < order.quantity:
+                        self.executed_reverse_strategies.add(tick.contract_name)
+                        logger.info(f"✅ [{tick.contract_name}] 检测到反手订单发生交易 (部分成交)，标记为已执行")
+                        break
 
         # 控制止损和反手逻辑
         if position and abs(position.size) > 0.001:
@@ -808,7 +816,7 @@ class PureStrategyEngine:
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             
-            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=size, is_valid=is_valid, failure_reason=reason)
+            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
         return None
 
     def _check_extreme_sell(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
@@ -848,7 +856,7 @@ class PureStrategyEngine:
             
             adj_price = max(tick.price * 0.98, mean * 1.3)
             
-            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Upper{percentile}:{round(upper,2)}", raw_size=size, is_valid=is_valid, failure_reason=reason)
+            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Upper{percentile}:{round(upper,2)}", raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
         return None
 
     def _calculate_liquidity_based_size(self, 
@@ -893,15 +901,15 @@ class PureStrategyEngine:
 
         # 5. 🛡️ 防火墙 2：全局资金/持仓硬性兜底
         # 即使流速允许买 100MW，我们也不能超过账户允许的最大持仓
-        total_holdings = sum(abs(p.size) for p in positions.values())
-        global_avail = max(0.0, self.max_position_size - total_holdings)
+        # total_holdings = sum(abs(p.size) for p in positions.values())
+        # global_avail = max(0.0, self.max_position_size - total_holdings)
         
-        final_size = min(target_size, global_avail)
+        # final_size = min(target_size, global_avail)
 
-        if final_size < min_size:
+        if target_size < min_size:
             return 0.0
             
         # 记录一下，方便调试
         # logger.info(f"🌊 [{tick.contract_name}] 流速: {avg_flow_rate:.2f} MW/m -> 建议: {target_size} MW")
         
-        return final_size
+        return target_size
