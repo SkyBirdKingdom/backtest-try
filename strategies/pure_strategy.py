@@ -303,12 +303,15 @@ class PureStrategyEngine:
     
     def _create_stop_and_reverse_signals(self, tick: TickEvent, position: Position, market_price: float, active_orders: List[Order], bars: List[dict], trigger_mode: str) -> List[TradeSignal]:
         signals = []
+
+        # --- 1. 检查是否存在【任何平仓单】(止盈 OR 止损) ---
+        # 如果存在任何平仓类订单，策略层不再发信号，而是让 ExitManager 接管修改订单
         
         # 1. 检查是否已有平仓单 (止盈单或止损单)
         existing_exit_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy.startswith("stop_loss") or order.strategy.startswith("consecutive_loss")):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("stop_loss") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("exit_")):
                 existing_exit_order = order
                 break
         

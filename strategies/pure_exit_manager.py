@@ -79,7 +79,10 @@ class PureExitManager:
             for order in list(active_orders): 
                 if order.contract_name == tick.contract_name:
                     is_exit_strategy = (order.strategy.startswith("auto_profit") or 
-                                        order.strategy.startswith("force_close"))
+                                        order.strategy.startswith("force_close") or
+                                        order.strategy.startswith("stop_loss") or 
+                                        order.strategy.startswith("exit_"))
+                    # is_reversal_strategy = order.strategy.startswith("trend_reversal")
                     if not is_exit_strategy:
                         exchange.cancel_order(order.client_order_id)
                         logger.info(f"🛑 [禁区风控] 强制撤销残留开仓单: {order.client_order_id}")
@@ -92,9 +95,16 @@ class PureExitManager:
 
         # 1. 检测数量是否一致 (Sync Check)
         qty_mismatch = False
+        side_mismatch = False
         if existing_exit_order:
             if abs(abs(position.size) - existing_exit_order.remaining_quantity) > 0.001:
                 qty_mismatch = True
+            
+            # 2. 【核心修复】检查方向差异
+            # 如果我是多头(size>0)，我需要卖出(SELL)平仓。如果订单是BUY，说明方向反了（可能是反手成交导致的）
+            expected_side = "SELL" if position.size > 0 else "BUY"
+            if existing_exit_order.side != expected_side:
+                side_mismatch = True
         elif not existing_exit_order:
             qty_mismatch = True
 
@@ -106,7 +116,7 @@ class PureExitManager:
         # 3. 执行管理
         self._manage_exit_order(
             exchange, position, tick, existing_exit_order, 
-            target_price, is_force_market, minutes_to_close, qty_mismatch
+            target_price, is_force_market, minutes_to_close, qty_mismatch, side_mismatch
         )
 
     # ----------------------------------------------------------------
@@ -130,9 +140,16 @@ class PureExitManager:
         existing_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy.startswith("exit_") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("exit_") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("stop_loss")):
                 existing_order = order
                 break
+        # 【核心修复】方向校验：如果因为反手成交导致持仓方向变了，旧止损单就是毒药，必须撤销
+        if existing_order:
+            expected_side = "SELL" if position.size > 0 else "BUY"
+            if existing_order.side != expected_side:
+                exchange.cancel_order(existing_order.client_order_id)
+                logger.warning(f"⚠️ [止损修正] 仓位反转/归零，撤销旧方向平仓单: {existing_order.client_order_id}")
+                return # 撤销后本轮结束，下一轮如果没有订单且有持仓会重新建单
         
         if is_force_market:
             if existing_order: exchange.cancel_order(existing_order.client_order_id)
@@ -146,7 +163,8 @@ class PureExitManager:
                 logger.info(f"🚀 [止损追价] {tick.contract_name} 调整价格 -> {target_price}")
         else:
             # 如果没有订单，新建一个
-            self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name="consecutive_loss_stop")
+            if abs(position.size) > 0.001:
+                self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name="consecutive_loss_stop")
 
     def _check_reverse_profit_exit(self, tick: TickEvent, position: Position, bars: List[dict]) -> bool:
         """
@@ -320,7 +338,7 @@ class PureExitManager:
     def _manage_exit_order(self, exchange, position: Position, tick: TickEvent, 
                            existing_order: Optional[Order], target_price: float, 
                            is_force_market: bool, minutes_to_close: float,
-                           qty_mismatch: bool):
+                           qty_mismatch: bool, side_mismatch: bool):
         
         now = tick.timestamp
         target_price = round(target_price, 2)
@@ -343,6 +361,16 @@ class PureExitManager:
             if existing_order:
                 exchange.cancel_order(existing_order.client_order_id)
             self._submit_force_close(exchange, position, tick)
+            return
+        
+        # 1. 致命错误：方向反了 (Side Mismatch)
+        # 这种情况通常发生在反手单成交后，持仓方向变了，但原来的止损单还在
+        if side_mismatch and existing_order:
+            exchange.cancel_order(existing_order.client_order_id)
+            logger.warning(f"⚠️ [方向修正] 仓位反转，撤销旧方向平仓单: {existing_order.client_order_id}")
+            # 撤销后，如果有持仓，立即提交新单
+            if abs(position.size) > 0.001:
+                self._submit_new_exit_order(exchange, position, tick, target_price, minutes_to_close, strategy_name=current_strategy_name)
             return
 
         # B. 常规调整
@@ -406,12 +434,15 @@ class PureExitManager:
         for order in orders:
             if order.contract_name == contract_name:
                 if order.state in ["NEW", "PARTIALLY_FILLED"]:
+                    if "trend_reversal" in order.strategy:
+                        continue
                     # if include_all:
                     #     return order
                     # 识别所有本管理器相关的策略名
                     if (order.strategy.startswith("auto_profit") or 
                         order.strategy.startswith("exit_") or
                         order.strategy.startswith("force_close") or 
-                        order.strategy.startswith("stop_loss")):
+                        order.strategy.startswith("stop_loss") or
+                        order.strategy.startswith("consecutive_loss")):
                         return order
         return None
