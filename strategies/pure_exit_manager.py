@@ -130,7 +130,7 @@ class PureExitManager:
         existing_order = None
         for order in active_orders:
             if order.contract_name == tick.contract_name and \
-               (order.strategy.startswith("auto_profit") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
+               (order.strategy.startswith("auto_profit") or order.strategy.startswith("exit_") or order.strategy.startswith("consecutive_loss") or order.strategy.startswith("stop_loss") or order.strategy.startswith("trend_reversal")):
                 existing_order = order
                 break
         
@@ -326,7 +326,7 @@ class PureExitManager:
         target_price = round(target_price, 2)
 
         # --- 【新增】确定当前的平仓策略标签 ---
-        current_strategy_name = "auto_exit_unknown"
+        current_strategy_name = "exit_unknown"
         if is_force_market:
             current_strategy_name = "exit_force_close"
         elif self.take_profit_end_minutes < minutes_to_close <= 240:
