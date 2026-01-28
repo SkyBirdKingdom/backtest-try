@@ -809,7 +809,8 @@ class PureStrategyEngine:
         if z_score <= -threshold:
             # 检查是否启用了动态仓位
             if params.get('use_dynamic_sizing', False):
-                max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+                # max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+                max_pos = self._calculate_time_based_limit(tick)
 
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
             # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
@@ -848,7 +849,8 @@ class PureStrategyEngine:
         if condition:
             # 检查是否启用了动态仓位
             if params.get('use_dynamic_sizing', False):
-                max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+                # max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+                max_pos = self._calculate_time_based_limit(tick)
 
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.SELL)
             is_valid = size > 0.001
@@ -913,3 +915,30 @@ class PureStrategyEngine:
         # logger.info(f"🌊 [{tick.contract_name}] 流速: {avg_flow_rate:.2f} MW/m -> 建议: {target_size} MW")
         
         return target_size
+    
+    def _calculate_time_based_limit(self, tick: TickEvent) -> float:
+        """
+        ⏳ 基于时间衰减的动态持仓上限
+        规则：每剩余1个完整的30分钟 = 1 MW 上限
+        """
+        # 1. 计算关闸时间 (交付前1小时)
+        gate_closure = tick.delivery_start - timedelta(hours=1)
+        
+        # 2. 如果已经超过关闸时间，上限为0
+        if tick.timestamp >= gate_closure:
+            return 0.0
+        
+        # 3. 计算剩余分钟数
+        delta = gate_closure - tick.timestamp
+        minutes_remaining = delta.total_seconds() / 60.0
+        
+        # 4. 计算完整的30分钟个数 (向下取整)
+        # 比如 65分钟 -> 2 个 30分钟
+        # 比如 59分钟 -> 1 个 30分钟
+        intervals = int(minutes_remaining // 30)
+        
+        # 5. 1个区间 = 1MW
+        limit = float(intervals * 1.0)
+        
+        # logger.info(f"⏳ [{tick.contract_name}] 剩余时间: {minutes_remaining:.1f}m -> {intervals}个30分钟 -> 上限: {limit}MW")
+        return max(0.0, limit)
