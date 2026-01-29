@@ -190,7 +190,7 @@ class VirtualExchange:
 
     def _check_order_timeout(self):
         for order in list(self.active_orders):
-            if not self.current_time or not order.timestamp or order.strategy == "auto_profit_taking" or order.strategy.startswith("force_close") or order.strategy.startswith("stop_loss"):
+            if not self.current_time or not order.timestamp or order.strategy.startswith("auto_profit") or order.strategy.startswith("force_close") or order.strategy.startswith("stop_loss") or order.strategy.startswith("exit_") or order.strategy.startswith("consecutive_loss"):
                 continue
             time_diff = (self.current_time - order.timestamp).total_seconds()
             if time_diff > self.order_timeout_seconds:
