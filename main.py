@@ -61,7 +61,7 @@ def main():
         
         # --- 策略参数 ---
         "strategy_params": {
-            "forbid_new_open_minutes": 20,
+            "forbid_new_open_minutes": 30,
             "signal_cooldown_seconds": 300,
             "price_change_threshold_ratio": 0.1,
 
@@ -70,7 +70,7 @@ def main():
             "stop_loss_end_minutes": 3,
             
             "super_mean_reversion_buy": {
-                "use_dynamic_sizing": True,      # 开启
+                "use_dynamic_sizing": False,      # 开启
                 "liquidity_lookback": 30,        # 看过去30分钟
                 "liquidity_participation": 0.20, # 吃掉预测量的 5%
                 "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
@@ -85,7 +85,7 @@ def main():
             },
             
             "optimized_extreme_sell": {
-                "use_dynamic_sizing": True,      # 开启
+                "use_dynamic_sizing": False,      # 开启
                 "liquidity_lookback": 30,        # 看过去30分钟
                 "liquidity_participation": 0.20, # 吃掉预测量的 5%
                 "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
@@ -151,12 +151,12 @@ def main():
 
     # 4. 运行回测
     # 请确保日期范围内你的数据库有数据
-    start_date = "2025-04-01"
-    end_date = "2026-01-13"
+    start_date = "2026-01-08"
+    end_date = "2026-01-08"
     
     # 可选：只回测特定的合约，填 None 则回测所有
-    # contract_filter = ["QH-20251227-95"] 
-    contract_filter = None
+    contract_filter = ["QH-20260108-34"] 
+    # contract_filter = None
 
     try:
         engine.run(start_date, end_date, contract_filter)

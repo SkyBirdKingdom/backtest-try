@@ -207,7 +207,7 @@ class VirtualExchange:
 
             # 订单提交增加延迟
             time_since_creation = (tick.timestamp - order.timestamp).total_seconds()
-            if time_since_creation < self.order_submission_delay:
+            if time_since_creation < self.order_submission_delay and not (order.strategy.startswith('force_close') or order.open_strategy.startswith('force_close')):
                 continue
 
             # 【核心修改】如果是强平单，无视价格限制，强制成交 (Market Order)
@@ -226,7 +226,8 @@ class VirtualExchange:
                 if order.strategy == "force_close_final":
                     exec_price = self._calculate_exec_price(tick.price, order.side)
                     self._execute_trade(order, order.remaining_quantity, exec_price, tick)
-                    self.active_orders.remove(order)
+                    if order.remaining_quantity <= 0.001:
+                        self.active_orders.remove(order)
                     continue
 
                 order.match_wait_count += 1
@@ -267,7 +268,7 @@ class VirtualExchange:
             order.state = "FULL_FILLED"
             action_log = "SYSTEM_FILLED"
         else:
-            order.remaining_quantity = round(new_remaining, 3)
+            order.remaining_quantity = round(new_remaining, 1)
             order.state = "PARTIALLY_FILLED"
             action_log = "SYSTEM_PARTIAL_FILL"
         

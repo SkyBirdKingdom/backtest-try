@@ -941,7 +941,7 @@ class PureStrategyEngine:
         intervals = int(minutes_remaining // 30)
         
         # 5. 1个区间 = 1MW
-        limit = float(intervals * 1.0)
+        limit = float(intervals * 4.0)
         
         # logger.info(f"⏳ [{tick.contract_name}] 剩余时间: {minutes_remaining:.1f}m -> {intervals}个30分钟 -> 上限: {limit}MW")
         return max(0.0, limit)
