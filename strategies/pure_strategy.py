@@ -84,7 +84,7 @@ class PureStrategyEngine:
         """更新策略感知的 PnL (备用接口)"""
         self.daily_realized_pnl += pnl
 
-    def on_tick(self, tick: TickEvent, positions: Dict[str, Position], active_orders: List[Order], account_info) -> Optional[TradeSignal]:
+    def on_tick(self, tick: TickEvent, positions: Dict[str, Position], active_orders: List[Order], account_info) -> List[TradeSignal]:
         """
         主入口函数 (适配 BacktestEngine)
         """
@@ -538,7 +538,7 @@ class PureStrategyEngine:
 
     def _check_cooldown(self, signal: TradeSignal, current_time: datetime) -> bool:
         strategy_name = signal.strategy_name
-        cooldown = self.params.get('signal_cooldown_seconds', 300)
+        cooldown = self.params.get('signal_cooldown_seconds', 5)
         key = signal.contract_name + strategy_name
         last_time = self.last_trade_times.get(key)
         if last_time and (current_time - last_time).total_seconds() < cooldown:

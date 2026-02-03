@@ -151,9 +151,15 @@ class PureExitManager:
                 logger.warning(f"⚠️ [止损修正] 仓位反转/归零，撤销旧方向平仓单: {existing_order.client_order_id}")
                 return # 撤销后本轮结束，下一轮如果没有订单且有持仓会重新建单
         
+        # 【核心修改】如果是强平阶段，升级订单策略
         if is_force_market:
-            if existing_order: exchange.cancel_order(existing_order.client_order_id)
-            self._submit_force_close(exchange, position, tick)
+            if existing_order:
+                # 升级现有订单为强平单，不需要撤单
+                if existing_order.strategy != "force_close_final":
+                    exchange.modify_order(existing_order.client_order_id, new_price=tick.price, new_strategy="force_close_final")
+                    logger.info(f"🚨 [止损转强平] 升级订单为强平单: {existing_order.client_order_id}")
+            else:
+                self._submit_force_close(exchange, position, tick)
             return
 
         if existing_order:
@@ -358,9 +364,14 @@ class PureExitManager:
         
         # A. 强平阶段
         if is_force_market:
+            # 【核心修改】直接升级现有订单，不撤单
             if existing_order:
-                exchange.cancel_order(existing_order.client_order_id)
-            self._submit_force_close(exchange, position, tick)
+                # 只有当策略还不是 force_close_final 时才升级，避免重复操作
+                if existing_order.strategy != "force_close_final":
+                    exchange.modify_order(existing_order.client_order_id, new_price=tick.price, new_strategy="force_close_final")
+                    logger.info(f"🚨 [时间到] 升级订单为强平单: {existing_order.client_order_id}")
+            else:
+                self._submit_force_close(exchange, position, tick)
             return
         
         # 1. 致命错误：方向反了 (Side Mismatch)

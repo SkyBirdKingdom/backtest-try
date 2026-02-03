@@ -1,7 +1,7 @@
 import logging
 from collections import defaultdict
 from typing import Dict, List
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from core.data_loader import DataLoader
 from core.exchange import VirtualExchange
@@ -31,6 +31,10 @@ class BacktestEngine:
         # 3. 初始化策略
         self.strategy = PureStrategyEngine(config)
         self.exit_manager = PureExitManager(config)
+
+        # 获取强平窗口阈值 (用于再撮合判断)
+        strategy_params = config.get('strategy_params', {})
+        self.stop_loss_end_minutes = int(strategy_params.get('stop_loss_end_minutes', 3))
         
         # 4. 内存数据库
         self.bars_memory: Dict[str, List[dict]] = defaultdict(list)
@@ -78,7 +82,6 @@ class BacktestEngine:
             if tick_count % 50000 == 0:
                 logger.info(f"进度: {tick.timestamp} | 交付日: {tick_delivery_date} | 当日PnL: {self.current_delivery_pnl:.2f}")
 
-            self.exit_manager.modify_order(self.exchange, self.exchange.positions, tick, self.exchange.active_orders)
 
             # 1. 交易所层
             self.exchange.on_tick(tick)
@@ -122,12 +125,38 @@ class BacktestEngine:
             for sig in signals:
                 self.recorder.record_signal(sig)
                 if sig.is_valid:
-                    self.exchange.submit_order(sig)
+                    current_orders = [order for order in self.exchange.active_orders if order.contract_name == sig.contract_name and order.open_strategy == sig.strategy_name and order.side == sig.action]
+                    if current_orders:
+                        self.exchange.modify_order(current_orders[0].client_order_id, sig.price, sig.size)
+                    else:
+                        self.exchange.submit_order(sig)
                 else:
                     self.reject_counter += 1
                     if self.reject_counter % 2000 == 0:
                         logger.info(f"🚫 信号被拒(采样): {sig.contract_name} 原因: [{sig.failure_reason}] DeliveryPnL: {self.current_delivery_pnl:.2f}")
-
+            
+            # ----------------------------------------------------------------------------------
+            # 【核心修正】Engine 时序优化 (Re-Match for Force Close)
+            # 如果当前是强平时间窗口(最后几分钟)，再次调用撮合。
+            # 这样 ExitManager 刚刚生成的强平单（或升级单）可以立即在当前 Tick 成交，
+            # 避免了"最后一分钟生成强平单但因为没有下一个Tick而无法成交"的Bug。
+            # ----------------------------------------------------------------------------------
+            if tick.delivery_start:
+                gate_closure = tick.delivery_start - timedelta(hours=1)
+                minutes_to_close = (gate_closure - tick.timestamp).total_seconds() / 60.0
+                
+                if minutes_to_close <= self.stop_loss_end_minutes:
+                    # 再次调用撮合，尝试即时成交刚才生成的强平单
+                    self.exchange.on_tick(tick)
+                    
+                    # 再次同步交易记录(为了盈亏统计准确性)
+                    current_trade_count = len(self.exchange.trades)
+                    if current_trade_count > self.last_processed_trade_count:
+                        new_trades = self.exchange.trades[self.last_processed_trade_count:]
+                        for trade in new_trades:
+                            if trade.delivery_start.date() == self.current_delivery_date:
+                                self.current_delivery_pnl += trade.pnl
+                        self.last_processed_trade_count = current_trade_count
         # 回测结束
         self._on_backtest_finished()
 

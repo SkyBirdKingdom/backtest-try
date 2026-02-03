@@ -30,13 +30,17 @@ class VirtualExchange:
         
         self._order_id_counter = 0
         self._trade_id_counter = 0
+
+        self._last_contract_tick: Dict[str, TickEvent] = {}
         
         self.order_history: List[Order] = [] 
 
     def on_tick(self, tick: TickEvent):
-        self.current_time = tick.timestamp
-        self._check_order_timeout()
-        self._match_orders(tick)
+        last_tick = self._last_contract_tick.get(tick.contract_name)
+        if last_tick is None or tick.trade_id != last_tick.trade_id:
+            self.current_time = tick.timestamp
+            # self._check_order_timeout()
+            self._match_orders(tick)
 
     # ----------------------------------------------------------------
     # 【核心修改】交割结算逻辑 (关闸清理)
@@ -150,7 +154,11 @@ class VirtualExchange:
         self._log_order_snapshot(order, "USER_SUBMIT")
         return True
 
-    def modify_order(self, client_order_id: str, new_price: Optional[float] = None, new_quantity: Optional[float] = None) -> bool:
+    def modify_order(self, client_order_id: str, new_price: Optional[float] = None, new_quantity: Optional[float] = None, new_strategy: Optional[str] = None) -> bool:
+        """
+        修改订单
+        :param new_strategy: 【新增】允许修改策略名(用于升级为强平单 force_close_final)
+        """
         for order in self.active_orders:
             if order.client_order_id == client_order_id:
                 updated = False
@@ -170,6 +178,15 @@ class VirtualExchange:
                     order.match_wait_count = 0 
                     updated = True
                     changes.append("QTY")
+                
+                # 【新增】支持策略变更（例如升级为强平单）
+                if new_strategy is not None and order.strategy != new_strategy:
+                    order.strategy = new_strategy
+                    # 如果升级为强平单，重置等待计数，确保撮合时能立即识别
+                    if "force_close" in new_strategy:
+                        order.match_wait_count = 9999 # 确保如果需要等待逻辑也能通过(虽然强平通常无视)
+                    updated = True
+                    changes.append("STRATEGY")
                 
                 if updated:
                     order.event_sequence_no += 1
@@ -225,7 +242,7 @@ class VirtualExchange:
             if is_price_match:
                 if order.strategy == "force_close_final":
                     exec_price = self._calculate_exec_price(tick.price, order.side)
-                    self._execute_trade(order, order.remaining_quantity, exec_price, tick)
+                    self._execute_trade(order, exec_price, tick)
                     if order.remaining_quantity <= 0.001:
                         self.active_orders.remove(order)
                     continue
@@ -233,22 +250,19 @@ class VirtualExchange:
                 order.match_wait_count += 1
                 
                 if order.match_wait_count >= self.execution_wait_trades:
-                    available_volume = tick.volume if tick.volume > 0 else 0.0
-                    fill_qty = min(order.remaining_quantity, available_volume)
+                    exec_price = self._calculate_exec_price(tick.price, order.side)
+                    self._execute_trade(order, exec_price, tick)
                     
-                    if fill_qty > 0.001: 
-                        exec_price = self._calculate_exec_price(tick.price, order.side)
-                        self._execute_trade(order, fill_qty, exec_price, tick)
-                        
-                        if order.remaining_quantity <= 0.001:
-                            self.active_orders.remove(order)
+                    if order.remaining_quantity <= 0.001:
+                        self.active_orders.remove(order)
 
     def _calculate_exec_price(self, market_price: float, side: str) -> float:
         if not self.slippage_enabled: return market_price
         if side == "BUY": return market_price * (1 + self.slippage_rate)
         else: return market_price * (1 - self.slippage_rate)
 
-    def _execute_trade(self, order: Order, execute_quantity: float, price: float, tick: TickEvent):
+    def _execute_trade(self, order: Order, price: float, tick: TickEvent):
+        execute_quantity = min(tick.volume, order.remaining_quantity)
         self._trade_id_counter += 1
         trade_id = f"BK_TRD_{self._trade_id_counter}"
         
@@ -293,6 +307,7 @@ class VirtualExchange:
             portfolio_id=order.portfolio_id
         )
         self.trades.append(trade)
+        self._last_contract_tick[tick.contract_name] = tick
         
         log_msg = f"成交: {order.contract_name} {order.side} {execute_quantity:.2f}MW @ {price:.2f} " \
                   f"(剩余 {order.remaining_quantity:.2f}, Seq={order.event_sequence_no}) | Fee: {fee:.4f}"
