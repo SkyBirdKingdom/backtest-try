@@ -3,3 +3,6 @@ numpy
 sqlalchemy
 psycopg2-binary
 scipy
+
+streamlit
+plotly

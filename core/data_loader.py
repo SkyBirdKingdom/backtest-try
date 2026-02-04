@@ -104,7 +104,10 @@ class DataLoader:
                         gate_closure_time = row.delivery_start - timedelta(hours=1)
                         minutes_to_close = (gate_closure_time - row.trade_time).total_seconds() / 60.0
                         
-                        if minutes_to_close > 240 or minutes_to_close < 0:
+                        # if minutes_to_close > 240 or minutes_to_close < 0:
+                        #     continue
+                        # FIXED: 放宽时间窗口限制，允许所有时间点的数据进入回测
+                        if minutes_to_close < 0:
                             continue
                         
                         total_valid += 1

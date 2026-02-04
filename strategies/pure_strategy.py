@@ -251,7 +251,7 @@ class PureStrategyEngine:
         actual_forbid_minutes = self.forbid_new_open_minutes
         
         # 窗口：240分钟 >= 剩余时间 > 禁止时间
-        if not (actual_forbid_minutes < minutes_to_close <= 240):
+        if not (actual_forbid_minutes < minutes_to_close):
             return []
 
         # 2. 必须有足够的历史数据 (至少10根)
@@ -411,10 +411,11 @@ class PureStrategyEngine:
             raw_signals.append(sig_ext)
         
         # 当前价格与持仓价格相比较超过30%，再买一笔
-        sig_more = self._can_do_more_positions(tick, positions, current_time)
-        if sig_more:
-            self._apply_risk_checks(sig_more, tick, bars, positions, current_time, current_daily_pnl)
-            raw_signals.append(sig_more)
+        # CONCLUSION: 该逻辑收益效果不明显，暂时注释掉
+        # sig_more = self._can_do_more_positions(tick, positions, current_time)
+        # if sig_more:
+        #     self._apply_risk_checks(sig_more, tick, bars, positions, current_time, current_daily_pnl)
+        #     raw_signals.append(sig_more)
         
         # =========================================================
         # 【新增】生产环境逻辑检查 (信号抑制 + 订单互斥)

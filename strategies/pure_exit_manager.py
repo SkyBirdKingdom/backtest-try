@@ -88,7 +88,10 @@ class PureExitManager:
                         exchange.cancel_order(order.client_order_id)
                         logger.info(f"🛑 [禁区风控] 强制撤销残留开仓单: {order.client_order_id}")
         
-        if minutes_to_close > 240 or minutes_to_close <= 0:
+        # if minutes_to_close > 240 or minutes_to_close <= 0:
+        #     return
+        # FIXED: 放宽时间窗口限制，允许所有时间点的数据进入回测
+        if minutes_to_close <= 0:
             return
 
         # 获取属于本管理器的平仓单
@@ -277,7 +280,7 @@ class PureExitManager:
         is_force_market = False
 
         # --- 阶段 1: 止盈阶段 ---
-        if self.take_profit_end_minutes < minutes_to_close <= 240:
+        if self.take_profit_end_minutes < minutes_to_close:
             start_time = position.last_size_change_time if position.last_size_change_time else position.timestamp
             start_minutes_to_close = self._get_minutes_to_close(tick.delivery_start, start_time)
             
@@ -354,7 +357,7 @@ class PureExitManager:
         current_strategy_name = "exit_unknown"
         if is_force_market:
             current_strategy_name = "exit_force_close"
-        elif self.take_profit_end_minutes < minutes_to_close <= 240:
+        elif self.take_profit_end_minutes < minutes_to_close:
             current_strategy_name = "exit_take_profit" # 止盈阶段
         elif self.breakeven_end_minutes < minutes_to_close <= self.take_profit_end_minutes:
             current_strategy_name = "exit_breakeven"   # 保本阶段
