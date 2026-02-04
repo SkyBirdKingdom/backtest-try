@@ -410,6 +410,12 @@ class PureStrategyEngine:
             self._apply_risk_checks(sig_ext, tick, bars, positions, current_time, current_daily_pnl)
             raw_signals.append(sig_ext)
         
+        # 当前价格与持仓价格相比较超过30%，再买一笔
+        sig_more = self._can_do_more_positions(tick, positions, current_time)
+        if sig_more:
+            self._apply_risk_checks(sig_more, tick, bars, positions, current_time, current_daily_pnl)
+            raw_signals.append(sig_more)
+        
         # =========================================================
         # 【新增】生产环境逻辑检查 (信号抑制 + 订单互斥)
         # =========================================================
@@ -784,6 +790,49 @@ class PureStrategyEngine:
         except Exception as e: 
             logger.error(f"Error in _check_time_to_close: {e}")
             return True
+
+    def _can_do_more_positions(self, tick: TickEvent, positions: Dict, now: datetime) -> Optional[TradeSignal]:
+        """
+            判断条件：当前市场价与持仓价比较，空仓涨幅30%，多仓跌幅30%，则再做一笔，没有次数限制，仅受限于最大仓位。只对普通开仓判断，反手仓不触发。
+	        执行动作：以当前市场价提交加仓订单，仓位大小为min(剩余仓位，单次最大开仓量)
+        """
+        signal = None
+        # 获取当前持仓信息
+        contract_name = tick.contract_name
+        curr_pos = positions.get(contract_name)
+        curr_side = 'BUY' if curr_pos and curr_pos.size > 0 else 'SELL' if curr_pos and curr_pos.size < 0 else 'FLAT'
+        entry_price = curr_pos.avg_price if curr_pos else 0.0
+        if curr_side == 'FLAT':
+            return signal  # 无持仓，直接返回None
+        if entry_price == 0.0:
+            return signal  # 无持仓，直接返回None
+        if curr_side == 'BUY':
+            price_increase = (entry_price - tick.price) / abs(entry_price) * 100
+            if price_increase >= 30.0:
+                max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
+                params = self.params.get('super_mean_reversion_buy', {}).copy()
+                params.update(override.get('super_mean_reversion_buy', {}))
+                
+                if not self._check_time_to_close(tick.delivery_start, now):
+                    return signal
+                    
+                size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
+                if size > 0.001:
+                    signal = TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, 'super_mean_reversion_buy', tick.delivery_start)
+        elif curr_side == 'SELL':
+            price_decrease = (tick.price - entry_price) / abs(entry_price) * 100
+            if price_decrease >= 30.0:
+                max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
+                params = self.params.get('optimized_extreme_sell', {}).copy()
+                params.update(override.get('optimized_extreme_sell', {}))
+                
+                if not self._check_time_to_close(tick.delivery_start, now):
+                    return signal
+                    
+                size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.SELL)
+                if size > 0.001:
+                    signal = TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, tick.price, 'optimized_extreme_sell', tick.delivery_start)
+        return signal
 
     def _check_mean_reversion(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
         strategy_name = "super_mean_reversion_buy"

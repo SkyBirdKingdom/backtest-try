@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from collections import deque
 from scipy.stats import linregress
 
+from core.exchange import VirtualExchange
 from core.models import TickEvent, TradeSignal, ActionType, Position, Order
 
 logger = logging.getLogger("PureExitManager")
@@ -398,7 +399,7 @@ class PureExitManager:
         # 定时调价 (每分钟) - 仅在非止损模式下，因为止损模式是实时追价
         last_update = self.last_order_update_time.get(tick.contract_name)
         if (not last_update) or (now - last_update).total_seconds() >= 60:
-            if existing_order and abs(existing_order.unit_price - target_price) > 0.05:
+            if existing_order:
                 if exchange.modify_order(existing_order.client_order_id, new_price=target_price):
                     self.last_order_update_time[tick.contract_name] = now
                     logger.info(f"调整平仓价 ({minutes_to_close:.1f}m left): {tick.contract_name} 价格->{target_price}")
@@ -421,7 +422,7 @@ class PureExitManager:
         exchange.submit_order(signal)
         logger.info(f"触发收盘前强平: {tick.contract_name} {action} @ {tick.price}")
 
-    def _submit_new_exit_order(self, exchange, position: Position, tick: TickEvent, target_price: float, minutes_to_close: float, strategy_name="auto_profit_taking"):
+    def _submit_new_exit_order(self, exchange: VirtualExchange, position: Position, tick: TickEvent, target_price: float, minutes_to_close: float, strategy_name="auto_profit_taking"):
         action = ActionType.SELL if position.size > 0 else ActionType.BUY
         signal = TradeSignal(
             timestamp=tick.timestamp,
