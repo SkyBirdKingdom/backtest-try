@@ -62,7 +62,7 @@ def main():
         # --- 策略参数 ---
         "strategy_params": {
             "forbid_new_open_minutes": 30,
-            "signal_cooldown_seconds": 300,
+            "signal_cooldown_seconds": 5,
             "price_change_threshold_ratio": 0.1,
 
             "take_profit_end_minutes": 10,
