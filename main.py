@@ -75,11 +75,18 @@ def main():
                 "liquidity_participation": 0.20, # 吃掉预测量的 5%
                 "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
                 "action": "BUY",
+                # "history_min_len": 10,
+                # "ma_window": 5,
+                # "std_ratio_threshold": 0.1,
+                # "threshold": 2,
+                # "position_ratio": 0.2,
+                # "position_split": 3,
+                # "min_open_size": 0.1
                 "history_min_len": 10,
-                "ma_window": 5,
-                "std_ratio_threshold": 0.1,
-                "threshold": 2,
-                "position_ratio": 0.2,
+                "percentile_window": 5,
+                "percentile_low": 5,
+                "threshold": 1.3,
+                "position_ratio": 0.6,
                 "position_split": 3,
                 "min_open_size": 0.1
             },
@@ -93,7 +100,6 @@ def main():
                 "history_min_len": 10,
                 "percentile_window": 5,
                 "percentile_high": 95,
-                "percentile_extreme": 99,
                 "threshold": 1.3,
                 "position_ratio": 0.6,
                 "position_split": 3,

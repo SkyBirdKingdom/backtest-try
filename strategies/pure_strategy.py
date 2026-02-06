@@ -277,23 +277,30 @@ class PureStrategyEngine:
         stop_triggered = False
         trigger_mode = "" # 用于记录触发模式
 
-        # --- 分支 A：严格模式 (Strict Mode) ---
-        # 条件：1. 触发过二次加仓; 2. 最近10根K线每一根的亏损都 > 0
-        if position.has_triggered_2nd_add:
-            is_strict_met = all(l > strict_threshold for l in loss_ratios)
-            if is_strict_met:
-                stop_triggered = True
-                trigger_mode = "Strict"
-                logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
+        # # --- 分支 A：严格模式 (Strict Mode) ---
+        # # 条件：1. 触发过二次加仓; 2. 最近10根K线每一根的亏损都 > 0
+        # if position.has_triggered_2nd_add:
+        #     is_strict_met = all(l > strict_threshold for l in loss_ratios)
+        #     if is_strict_met:
+        #         stop_triggered = True
+        #         trigger_mode = "Strict"
+        #         logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
 
-        # --- 分支 B：普通模式 (Normal Mode) ---
-        # 条件：最近10根K线每一根的亏损都 >= 阈值 (不要求二次加仓)
-        if not stop_triggered:
-            is_normal_met = all(l >= normal_threshold for l in loss_ratios)
-            if is_normal_met:
-                stop_triggered = True
-                trigger_mode = "Normal"
-                logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损 >= {normal_threshold*100}%")
+        # # --- 分支 B：普通模式 (Normal Mode) ---
+        # # 条件：最近10根K线每一根的亏损都 >= 阈值 (不要求二次加仓)
+        # if not stop_triggered:
+        #     is_normal_met = all(l >= normal_threshold for l in loss_ratios)
+        #     if is_normal_met:
+        #         stop_triggered = True
+        #         trigger_mode = "Normal"
+        #         logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损 >= {normal_threshold*100}%")
+
+        # 止损逻辑全部走严格模式
+        is_strict_met = all(l > strict_threshold for l in loss_ratios)
+        if is_strict_met:
+            stop_triggered = True
+            trigger_mode = "Strict"
+            logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
         
         if stop_triggered:
             position.stop_loss_triggered = True
@@ -835,42 +842,85 @@ class PureStrategyEngine:
                     signal = TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.SELL, size, tick.price, 'optimized_extreme_sell', tick.delivery_start)
         return signal
 
+    # 原始均值回归做多逻辑，暂时注释掉
+    # def _check_mean_reversion(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
+    #     strategy_name = "super_mean_reversion_buy"
+    #     max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
+    #     params = self.params.get(strategy_name, {}).copy()
+    #     params.update(override.get(strategy_name, {}))
+        
+    #     window = params.get('ma_window', 20)
+    #     threshold = params.get('threshold', 2.0)
+    #     # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面检查
+    #     std_ratio = params.get('std_ratio_threshold', 0.05)
+        
+    #     if len(bars) < params.get('history_min_len', 5): return None
+        
+    #     prices = [float(b.get('avg_price', b['close'])) for b in bars[-window:]]
+    #     if not prices: return None
+        
+    #     mean = np.mean(prices)
+    #     std = np.std(prices)
+        
+    #     if std <= abs(mean * std_ratio): return None
+    #     if std == 0: return None
+        
+    #     z_score = (tick.price - mean) / std
+        
+    #     if z_score <= -threshold:
+    #         # 检查是否启用了动态仓位
+    #         if params.get('use_dynamic_sizing', False):
+    #             # max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
+    #             max_pos = self._calculate_time_based_limit(tick)
+
+    #         size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
+    #         # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
+    #         is_valid = size > 0.001
+    #         reason = "" if is_valid else "Position Limit Reached (Size=0)"
+            
+    #         return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
+    #     return None
+
+    # 新版均值回归做多逻辑，逻辑与做空逻辑对称，判断保持一致
     def _check_mean_reversion(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
         strategy_name = "super_mean_reversion_buy"
         max_pos, override = self._get_delivery_rule_config(tick.delivery_start)
         params = self.params.get(strategy_name, {}).copy()
         params.update(override.get(strategy_name, {}))
         
-        window = params.get('ma_window', 20)
-        threshold = params.get('threshold', 2.0)
-        # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面检查
-        std_ratio = params.get('std_ratio_threshold', 0.05)
+        window = params.get('percentile_window', 20)
+        percentile = params.get('percentile_low', 5)
+        # cooldown = params.get('signal_cooldown_seconds', 300) # 移到外面
+        threshold = params.get('threshold', 0.7)
         
         if len(bars) < params.get('history_min_len', 5): return None
         
         prices = [float(b.get('avg_price', b['close'])) for b in bars[-window:]]
         if not prices: return None
         
+        lower = np.percentile(prices, percentile)
         mean = np.mean(prices)
-        std = np.std(prices)
         
-        if std <= abs(mean * std_ratio): return None
-        if std == 0: return None
-        
-        z_score = (tick.price - mean) / std
-        
-        if z_score <= -threshold:
+        condition = False
+        if mean < 0:
+            if tick.price < 0: condition = (mean - tick.price) >= abs(mean) * threshold
+            else: condition = tick.price < lower and tick.price < mean * threshold
+        else:
+            condition = tick.price < lower and tick.price < threshold * mean
+            
+        if condition:
             # 检查是否启用了动态仓位
             if params.get('use_dynamic_sizing', False):
                 # max_pos = self._calculate_liquidity_based_size(tick, bars, positions, params)
                 max_pos = self._calculate_time_based_limit(tick)
 
             size = self._calculate_action_and_size(tick.contract_name, positions, max_pos, params, ActionType.BUY)
-            # is_valid 由外部 _apply_risk_checks 进一步确认，这里先认为如果是0就是无效
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             
-            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, tick.price, strategy_name, tick.delivery_start, confidence=min(abs(z_score)/threshold, 1.0), open_strategy=strategy_name, z_score=round(z_score,3), mean_price=round(mean,2), std_price=round(std,2), raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
+            adj_price = min(tick.price * 1.02, mean * 0.7)
+            
+            return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Lower{percentile}:{round(lower,2)}", raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
         return None
 
     def _check_extreme_sell(self, tick: TickEvent, bars: List[dict], positions: Dict, now: datetime) -> Optional[TradeSignal]:
