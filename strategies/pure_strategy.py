@@ -277,30 +277,30 @@ class PureStrategyEngine:
         stop_triggered = False
         trigger_mode = "" # 用于记录触发模式
 
-        # # --- 分支 A：严格模式 (Strict Mode) ---
-        # # 条件：1. 触发过二次加仓; 2. 最近10根K线每一根的亏损都 > 0
-        # if position.has_triggered_2nd_add:
-        #     is_strict_met = all(l > strict_threshold for l in loss_ratios)
-        #     if is_strict_met:
-        #         stop_triggered = True
-        #         trigger_mode = "Strict"
-        #         logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
+        # --- 分支 A：严格模式 (Strict Mode) ---
+        # 条件：1. 触发过二次加仓; 2. 最近10根K线每一根的亏损都 > 0
+        if position.has_triggered_2nd_add:
+            is_strict_met = all(l > strict_threshold for l in loss_ratios)
+            if is_strict_met:
+                stop_triggered = True
+                trigger_mode = "Strict"
+                logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
 
-        # # --- 分支 B：普通模式 (Normal Mode) ---
-        # # 条件：最近10根K线每一根的亏损都 >= 阈值 (不要求二次加仓)
-        # if not stop_triggered:
-        #     is_normal_met = all(l >= normal_threshold for l in loss_ratios)
-        #     if is_normal_met:
-        #         stop_triggered = True
-        #         trigger_mode = "Normal"
-        #         logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损 >= {normal_threshold*100}%")
+        # --- 分支 B：普通模式 (Normal Mode) ---
+        # 条件：最近10根K线每一根的亏损都 >= 阈值 (不要求二次加仓)
+        if not stop_triggered:
+            is_normal_met = all(l >= normal_threshold for l in loss_ratios)
+            if is_normal_met:
+                stop_triggered = True
+                trigger_mode = "Normal"
+                logger.warning(f"🚫 [{contract_name}] 普通模式触发: 连续10根K线亏损 >= {normal_threshold*100}%")
 
         # 止损逻辑全部走严格模式
-        is_strict_met = all(l > strict_threshold for l in loss_ratios)
-        if is_strict_met:
-            stop_triggered = True
-            trigger_mode = "Strict"
-            logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
+        # is_strict_met = all(l > strict_threshold for l in loss_ratios)
+        # if is_strict_met:
+        #     stop_triggered = True
+        #     trigger_mode = "Strict"
+        #     logger.warning(f"🔥 [{contract_name}] 严格模式触发: 二次加仓且连续10根K线亏损>0")
         
         if stop_triggered:
             position.stop_loss_triggered = True
@@ -903,10 +903,15 @@ class PureStrategyEngine:
         
         condition = False
         if mean < 0:
-            if tick.price < 0: condition = (mean - tick.price) >= abs(mean) * threshold
-            else: condition = tick.price < lower and tick.price < mean * threshold
+            if tick.price < 0:
+                condition = abs(tick.price) >= abs(mean) * threshold
         else:
-            condition = tick.price < lower and tick.price < threshold * mean
+            # 正均价情况：当前价格低于5分位且低于均价除以阈值
+            if tick.price < 0:
+                condition = abs(tick.price) >= mean * threshold
+            else:
+                # condition = tick.price <= lower and tick.price <= mean / threshold
+                condition = tick.price <= mean / threshold
             
         if condition:
             # 检查是否启用了动态仓位
@@ -918,7 +923,7 @@ class PureStrategyEngine:
             is_valid = size > 0.001
             reason = "" if is_valid else "Position Limit Reached (Size=0)"
             
-            adj_price = min(tick.price * 1.02, mean * 0.7)
+            adj_price = tick.price + (mean - tick.price) * 0.02 # 轻微调整价格，增加成交概率
             
             return TradeSignal(now, tick.contract_name, tick.contract_id, ActionType.BUY, size, round(adj_price, 2), strategy_name, tick.delivery_start, open_strategy=strategy_name, z_score=0.0, mean_price=round(mean,2), std_price=0.0, trend_info=f"Lower{percentile}:{round(lower,2)}", raw_size=max_pos, is_valid=is_valid, failure_reason=reason)
         return None
@@ -944,10 +949,14 @@ class PureStrategyEngine:
         
         condition = False
         if mean < 0:
-            if tick.price > 0: condition = (tick.price - mean) >= abs(mean) * threshold
-            else: condition = tick.price > upper and tick.price > mean / threshold
+            if tick.price > 0: 
+                condition = (tick.price - mean) >= abs(mean) * threshold
+            else: 
+                # condition = tick.price > upper and tick.price > mean / threshold
+                condition = tick.price > mean / threshold
         else:
-            condition = tick.price > upper and tick.price > threshold * mean
+            # condition = tick.price > upper and tick.price > threshold * mean
+            condition = tick.price > threshold * mean
             
         if condition:
             # 检查是否启用了动态仓位

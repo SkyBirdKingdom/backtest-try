@@ -161,7 +161,7 @@ def main():
     end_date = "2026-01-13"
     
     # 可选：只回测特定的合约，填 None 则回测所有
-    # contract_filter = ["PH-20250624-12"] 
+    # contract_filter = ["QH-20260113-34"] 
     contract_filter = None
 
     try:

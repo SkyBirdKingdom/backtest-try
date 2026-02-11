@@ -38,6 +38,18 @@ class PureExitManager:
             return
 
         minutes_to_close = self._get_minutes_to_close(tick.delivery_start, tick.timestamp)
+        # 0. 关闸前撤销非平仓单
+        if minutes_to_close <= self.forbid_new_open_minutes: 
+            for order in list(active_orders): 
+                if order.contract_name == tick.contract_name:
+                    is_exit_strategy = (order.strategy.startswith("auto_profit") or 
+                                        order.strategy.startswith("force_close") or
+                                        order.strategy.startswith("stop_loss") or 
+                                        order.strategy.startswith("exit_"))
+                    # is_reversal_strategy = order.strategy.startswith("trend_reversal")
+                    if not is_exit_strategy:
+                        exchange.cancel_order(order.client_order_id)
+                        logger.info(f"🛑 [禁区风控] 强制撤销残留开仓单: {order.client_order_id}")
         
         # 1. 维护 Tick History (用于少亏阶段均价计算)
         if tick.contract_name not in self.tick_history:
@@ -75,18 +87,6 @@ class PureExitManager:
         # 【核心逻辑 C】常规生命周期 (Profit -> Breakeven -> Reduce Loss -> Force)
         # ---------------------------------------------------------------------
         
-        # 0. 关闸前撤销非平仓单
-        if minutes_to_close <= self.forbid_new_open_minutes: 
-            for order in list(active_orders): 
-                if order.contract_name == tick.contract_name:
-                    is_exit_strategy = (order.strategy.startswith("auto_profit") or 
-                                        order.strategy.startswith("force_close") or
-                                        order.strategy.startswith("stop_loss") or 
-                                        order.strategy.startswith("exit_"))
-                    # is_reversal_strategy = order.strategy.startswith("trend_reversal")
-                    if not is_exit_strategy:
-                        exchange.cancel_order(order.client_order_id)
-                        logger.info(f"🛑 [禁区风控] 强制撤销残留开仓单: {order.client_order_id}")
         
         # if minutes_to_close > 240 or minutes_to_close <= 0:
         #     return
