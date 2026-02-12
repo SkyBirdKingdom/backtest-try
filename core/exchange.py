@@ -296,7 +296,7 @@ class VirtualExchange:
             contract_id=order.contract_id,
             action=order.side,
             size=execute_quantity, 
-            price=price,
+            price=order.unit_price,
             strategy=order.strategy,
             delivery_start=order.delivery_start,
             pnl=pnl, 
@@ -380,7 +380,7 @@ class VirtualExchange:
         # 3. 成本计算 (加权平均)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
             # 加仓 or 建仓
-            total_val = abs(old_size) * pos.avg_price + abs(size_delta) * price
+            total_val = abs(old_size) * pos.avg_price + abs(size_delta) * order.unit_price
             if abs(new_size) > 0:
                 pos.avg_price = total_val / abs(new_size)
             pos.size = new_size
@@ -405,7 +405,7 @@ class VirtualExchange:
             pos.size = new_size
             
             if is_reversal:
-                pos.avg_price = price
+                pos.avg_price = order.unit_price
                 pos.strategy_name = order.strategy
         
         pos.timestamp = self.current_time

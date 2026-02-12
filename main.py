@@ -157,12 +157,15 @@ def main():
 
     # 4. 运行回测
     # 请确保日期范围内你的数据库有数据
-    start_date = "2025-04-01"
-    end_date = "2026-01-13"
+    # start_date = "2025-04-01"
+    # end_date = "2026-01-13"
+
+    start_date = "2026-01-08"
+    end_date = "2026-01-08"
     
     # 可选：只回测特定的合约，填 None 则回测所有
-    # contract_filter = ["QH-20260113-34"] 
-    contract_filter = None
+    contract_filter = ["QH-20260108-74"] 
+    # contract_filter = None
 
     try:
         engine.run(start_date, end_date, contract_filter)
