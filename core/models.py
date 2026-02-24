@@ -119,6 +119,8 @@ class Position:
     has_triggered_2nd_add: bool = False  # 是否触发过二次加仓 (严格模式止损依据)
     has_reversed: bool = False           # 是否已经执行过反手 (防止反复反手)
     stop_loss_triggered: bool = False    # 【关键】标记该持仓是否已触发止损逻辑(交给ExitManager接管)
+    has_decreased: bool = False            # 是否触发减仓或者平仓
+    has_fully_2nd_added: bool = False
 
     # --- 【新增】记录参与构建该持仓的订单ID集合 ---
     involved_order_ids: Set[str] = field(default_factory=set)

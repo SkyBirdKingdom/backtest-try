@@ -1,228 +1,172 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sqlalchemy import create_engine
+import re
 
 # --- 配置 ---
-# 请确保这里的数据库连接字符串与你 main.py 中的一致
 DB_URL = "postgresql://postgres:123456@127.0.0.1:5432/nordpool_db?client_encoding=utf8"
 
-# 设置页面布局为宽屏模式
-st.set_page_config(page_title="回测交易可视化看板", layout="wide")
+st.set_page_config(page_title="NordPool 策略分析中心", layout="wide")
 
-# --- 数据库函数 ---
 @st.cache_resource
 def get_engine():
     return create_engine(DB_URL)
 
-def get_market_data(contract_name, area=None):
-    """读取并去重市场行情数据"""
-    engine = get_engine()
-    query = f"""
-    SELECT trade_time, contract_name, price, volume, trade_id, delivery_area 
-    FROM trades 
-    WHERE contract_name = '{contract_name}'
-    """
-    if area:
-        query += f" AND delivery_area = '{area}'"
-    
-    query += " ORDER BY trade_time ASC"
-    
+# --- 核心数据获取函数 ---
+def get_all_run_ids():
+    query = "SELECT DISTINCT run_id FROM backtest_trades ORDER BY run_id DESC"
     try:
-        df = pd.read_sql(query, engine)
-        if not df.empty:
-            # 需求：根据 trade_id 去重
-            df = df.drop_duplicates(subset=['trade_id'])
-        return df
-    except Exception as e:
-        st.error(f"读取市场数据失败: {e}")
-        return pd.DataFrame()
+        return pd.read_sql(query, get_engine())['run_id'].tolist()
+    except: return []
 
-def get_backtest_trades(contract_name, run_id=None):
-    """读取回测交易记录"""
-    engine = get_engine()
-    query = f"""
-    SELECT * FROM backtest_trades 
-    WHERE contract_name = '{contract_name}'
-    """
+def get_contracts_by_run(run_ids):
+    if not run_ids: return []
+    ids_str = "', '".join(run_ids)
+    query = f"SELECT DISTINCT contract_name FROM backtest_contract_stats WHERE run_id IN ('{ids_str}')"
+    return pd.read_sql(query, get_engine())['contract_name'].tolist()
+
+def get_market_data(contract_name):
+    query = f"SELECT trade_time, price, volume, trade_id FROM trades WHERE contract_name = '{contract_name}' ORDER BY trade_time ASC"
+    df = pd.read_sql(query, get_engine())
+    return df.drop_duplicates(subset=['trade_id'])
+
+def get_backtest_trades(contract_name, run_id):
+    query = f"SELECT * FROM backtest_trades WHERE contract_name = '{contract_name}' AND run_id = '{run_id}' ORDER BY timestamp ASC"
+    return pd.read_sql(query, get_engine())
+
+# --- 页面一：单合约深度分析 ---
+def render_single_contract_analysis():
+    st.sidebar.header("🔍 过滤条件")
+    all_runs = get_all_run_ids()
+    selected_run = st.sidebar.selectbox("1. 选择回测批次 (Run ID)", all_runs)
     
-    # 如果指定了 run_id，则只看该次运行的结果
-    if run_id:
-        query += f" AND run_id = '{run_id}'"
+    relevant_contracts = get_contracts_by_run([selected_run]) if selected_run else []
+    selected_contract = st.sidebar.selectbox("2. 选择合约", relevant_contracts)
     
-    query += " ORDER BY timestamp ASC"
-    
-    try:
-        df = pd.read_sql(query, engine)
-        return df
-    except Exception as e:
-        st.error(f"读取回测数据失败: {e}")
-        return pd.DataFrame()
+    show_market_dots = st.sidebar.checkbox("显示市场成交散点", value=False)
 
-def get_distinct_runs(contract_name):
-    """获取该合约存在的所有 run_id"""
-    engine = get_engine()
-    query = f"SELECT DISTINCT run_id FROM backtest_trades WHERE contract_name = '{contract_name}' ORDER BY run_id DESC"
-    try:
-        df = pd.read_sql(query, engine)
-        return df['run_id'].tolist()
-    except:
-        return []
+    if selected_run and selected_contract:
+        market_df = get_market_data(selected_contract)
+        trades_df = get_backtest_trades(selected_contract, selected_run)
 
-# --- 侧边栏：查询条件 ---
-st.sidebar.header("🔍 查询条件")
-# 默认区域
-selected_area = st.sidebar.text_input("区域 (Delivery Area)", value="SE3") 
-# 默认合约
-contract_name_input = st.sidebar.text_input("合约名称 (Contract Name)", value="PH-20250624-12")
-
-search_btn = st.sidebar.button("查询 / 刷新")
-
-if search_btn or contract_name_input:
-    st.title(f"📊 交易回测分析: {contract_name_input}")
-
-    # 1. 获取 Run IDs
-    run_ids = get_distinct_runs(contract_name_input)
-    selected_run_id = None
-    if run_ids:
-        selected_run_id = st.selectbox("选择回测批次 (Run ID)", run_ids, index=0)
-    else:
-        st.warning("未在 backtest_trades 表中找到该合约的回测记录。")
-
-    # 2. 加载数据
-    with st.spinner('正在从数据库加载数据...'):
-        market_df = get_market_data(contract_name_input, selected_area)
-        trades_df = get_backtest_trades(contract_name_input, selected_run_id)
-
-    # 3. 数据概览
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("市场数据条数", len(market_df))
-    col2.metric("策略交易次数", len(trades_df))
-    
-    if not trades_df.empty:
-        total_pnl = trades_df['pnl'].sum()
-        win_rate = (trades_df[trades_df['pnl'] > 0].shape[0] / len(trades_df)) * 100 if len(trades_df) > 0 else 0
-        col3.metric("总盈亏 (PnL)", f"{total_pnl:.2f} EUR", delta_color="normal")
-        col4.metric("胜率 (Win Rate)", f"{win_rate:.2f}%")
-
-    # 4. 绘制交互式图表
-    if not market_df.empty:
-        st.subheader("📈 价格走势与买卖点 (支持缩放和滚动)")
+        st.title(f"📈 交易分析: {selected_contract}")
         
-        fig = go.Figure()
-
-        # A. 绘制市场价格线 + 真实成交点 (Market Trades)
-        # 修改点：mode='lines+markers'，并添加 hovertemplate 显示量价
-        fig.add_trace(go.Scattergl(
-            x=market_df['trade_time'],
-            y=market_df['price'],
-            mode='lines+markers', # 关键修改：显示线和点
-            name='市场成交 (Market)',
-            line=dict(color='#636EFA', width=1),
-            # 市场点设为小蓝点，半透明，避免喧宾夺主
-            marker=dict(symbol='circle', size=4, color='#636EFA', opacity=0.6), 
-            text=market_df['volume'], # 将 volume 传入 text 字段供 hover 使用
-            hovertemplate=(
-                "<b>市场成交</b><br>" +
-                "时间: %{x}<br>" +
-                "价格: %{y:.2f} EUR<br>" +
-                "成交量: %{text:.1f} MW<br>" +
-                "<extra></extra>" # 隐藏默认的 trace name 标签
-            )
-        ))
-
-        # B. 绘制回测买卖点 (Strategy Trades)
+        # 指标栏
         if not trades_df.empty:
-            # 买入点：绿色圆点
-            buys = trades_df[trades_df['action'] == 'BUY']
-            if not buys.empty:
-                fig.add_trace(go.Scattergl(
-                    x=buys['timestamp'],
-                    y=buys['price'],
-                    mode='markers',
-                    name='策略买入 (BUY)',
-                    # 策略点设为大绿点，带黑边，非常醒目
-                    marker=dict(symbol='circle', size=12, color='#00CC96', line=dict(width=2, color='DarkSlateGrey')),
-                    # 悬停显示策略详情
-                    text=buys.apply(lambda row: f"🟢 <b>策略买入</b><br>策略: {row['strategy']}<br>数量: {row['size']}", axis=1),
-                    hovertemplate="%{text}<br>价格: %{y:.2f}<br>时间: %{x}<extra></extra>"
-                ))
+            total_pnl = trades_df['pnl'].sum()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("总盈亏", f"{total_pnl:.2f} EUR")
+            c2.metric("交易笔数", len(trades_df))
+            c3.metric("平均每笔盈亏", f"{(total_pnl/len(trades_df)):.2f} EUR")
 
-            # 卖出点：红色圆点
-            sells = trades_df[trades_df['action'] == 'SELL']
-            if not sells.empty:
-                fig.add_trace(go.Scattergl(
-                    x=sells['timestamp'],
-                    y=sells['price'],
-                    mode='markers',
-                    name='策略卖出 (SELL)',
-                    # 策略点设为大红点，带黑边
-                    marker=dict(symbol='circle', size=12, color='#EF553B', line=dict(width=2, color='DarkSlateGrey')),
-                    # 悬停显示盈亏详情
-                    text=sells.apply(lambda row: f"🔴 <b>策略卖出</b><br>策略: {row['strategy']}<br>数量: {row['size']}<br>盈亏: {row['pnl']:.2f}", axis=1),
-                    hovertemplate="%{text}<br>价格: %{y:.2f}<br>时间: %{x}<extra></extra>"
-                ))
-
-        # C. 布局配置优化
-        fig.update_layout(
-            title=f'{contract_name_input} 交易详情',
-            xaxis=dict(
-                title='时间',
-                rangeslider=dict(visible=True), # 启用底部时间轴滑块
-                type='date'
-            ),
-            yaxis_title='价格 (EUR)',
-            hovermode='closest', # 改为 closest，这样鼠标指哪里显示哪里，避免多个标签重叠
-            height=600,
-            margin=dict(l=20, r=20, t=50, b=20),
-            dragmode='pan', # 默认平移模式
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
-            )
-        )
-        
-        # 允许滚轮缩放
-        config = {
-            'scrollZoom': True, 
-            'displayModeBar': True,
-            'modeBarButtons.add': ['drawline', 'drawopenpath', 'eraseshape']
-        }
-
-        st.plotly_chart(fig, use_container_width=True, config=config)
-    else:
-        st.warning("未找到该合约的市场数据，无法绘图。请检查合约名称或 trades 表数据。")
-
-    # 5. 展示数据表格
-    st.markdown("---")
-    
-    tab1, tab2 = st.tabs(["📝 回测交易明细", "📋 市场行情原始数据"])
-    
-    with tab1:
-        st.subheader(f"回测交易记录 ({len(trades_df)} 条)")
-        if not trades_df.empty:
-            display_cols = ['trade_id', 'timestamp', 'action', 'price', 'size', 'pnl', 'strategy', 'open_strategy', 'delivery_start']
-            valid_cols = [c for c in display_cols if c in trades_df.columns]
-            st.dataframe(
-                trades_df[valid_cols].style.format({
-                    'price': '{:.2f}',
-                    'size': '{:.1f}',
-                    'pnl': '{:.2f}'
-                }).applymap(lambda x: 'color: green' if x > 0 else 'color: red' if x < 0 else '', subset=['pnl']),
-                use_container_width=True
-            )
-        else:
-            st.info("无回测交易数据")
-
-    with tab2:
-        st.subheader(f"市场行情数据 (去重后: {len(market_df)} 条)")
+        # 图表展示
         if not market_df.empty:
-            st.dataframe(
-                market_df.style.format({'price': '{:.2f}', 'volume': '{:.1f}'}),
-                use_container_width=True
-            )
-        else:
-            st.info("无市场数据")
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            
+            # 市场价格背景线 (设置 hoverinfo='skip' 解决干扰)
+            fig.add_trace(go.Scattergl(
+                x=market_df['trade_time'], y=market_df['price'],
+                name='市场价格', line=dict(color='rgba(100, 100, 100, 0.2)', width=1),
+                hoverinfo='skip'
+            ), row=1, col=1)
+
+            if show_market_dots:
+                fig.add_trace(go.Scattergl(
+                    x=market_df['trade_time'], y=market_df['price'], mode='markers',
+                    name='市场成交', marker=dict(size=3, color='rgba(100, 150, 250, 0.2)'),
+                    hoverinfo='skip'
+                ), row=1, col=1)
+
+            # 回测买卖点
+            if not trades_df.empty:
+                for action, color, symbol in [('BUY', '#00CC96', 'triangle-up'), ('SELL', '#EF553B', 'triangle-down')]:
+                    mask = trades_df['action'] == action
+                    sub = trades_df[mask]
+                    fig.add_trace(go.Scattergl(
+                        x=sub['timestamp'], y=sub['price'], mode='markers',
+                        name=f'策略-{action}', marker=dict(symbol=symbol, size=12, color=color, line=dict(width=1, color='white')),
+                        customdata=sub[['strategy', 'size', 'pnl', 'open_strategy']],
+                        hovertemplate="<b>%{name}</b><br>价格: %{y}<br>数量: %{customdata[1]}<br>策略: %{customdata[0]}<br>盈亏: %{customdata[2]}<extra></extra>"
+                    ), row=1, col=1)
+
+                trades_df['cum_pnl'] = trades_df['pnl'].cumsum()
+                fig.add_trace(go.Scattergl(
+                    x=trades_df['timestamp'], y=trades_df['cum_pnl'],
+                    name='累计盈亏', fill='tozeroy', line=dict(color='gold')
+                ), row=2, col=1)
+
+            fig.update_layout(height=700, hovermode='x unified', xaxis2_rangeslider_visible=True)
+            st.plotly_chart(fig, use_container_width=True)
+
+        # 恢复数据表格
+        tab1, tab2 = st.tabs(["📝 回测交易明细", "📋 真实市场成交数据"])
+        with tab1:
+            st.dataframe(trades_df.style.highlight_max(axis=0, subset=['pnl'], color='#90ee90'), use_container_width=True)
+        with tab2:
+            st.dataframe(market_df, use_container_width=True)
+
+# --- 页面二：日度多合约对比 ---
+def render_daily_comparison():
+    st.title("📅 日度多合约收益对比分析")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        target_date = st.date_input("选择目标日期", value=pd.to_datetime("2026-01-08"))
+    with col2:
+        all_runs = get_all_run_ids()
+        selected_runs = st.multiselect("选择参与对比的 Run ID", all_runs, default=all_runs[:1] if all_runs else [])
+
+    if not selected_runs:
+        st.warning("请至少选择一个 Run ID")
+        return
+
+    date_str = target_date.strftime("%Y%m%d")
+    run_ids_sql = "', '".join(selected_runs)
+    
+    # 匹配 PH-YYYYMMDD-xx 或 QH-YYYYMMDD-xx 的逻辑
+    query = f"""
+        SELECT run_id, contract_name, SUM(pnl) as total_pnl, COUNT(*) as trade_count
+        FROM backtest_trades
+        WHERE run_id IN ('{run_ids_sql}')
+          AND (contract_name LIKE 'PH-{date_str}-%%' OR contract_name LIKE 'QH-{date_str}-%%')
+        GROUP BY run_id, contract_name
+    """
+    
+    df_daily = pd.read_sql(query, get_engine())
+
+    if df_daily.empty:
+        st.info(f"未找到日期 {target_date} 相关的合约回测数据。")
+    else:
+        # 数据透视以便对比
+        comparison_df = df_daily.pivot(index='contract_name', columns='run_id', values='total_pnl').fillna(0)
+        
+        st.subheader("📊 各合约收益对比 (EUR)")
+        st.bar_chart(comparison_df)
+
+        # 汇总统计
+        st.subheader("📋 统计摘要")
+        summary = df_daily.groupby('run_id').agg({
+            'total_pnl': 'sum',
+            'contract_name': 'nunique',
+            'trade_count': 'sum'
+        }).rename(columns={'contract_name': '涉及合约数', 'total_pnl': '当日总盈亏', 'trade_count': '总交易笔数'})
+        
+        st.table(summary.style.background_gradient(cmap='RdYlGn', subset=['当日总盈亏']))
+
+        with st.expander("查看原始统计数据"):
+            st.dataframe(df_daily, use_container_width=True)
+
+# --- 主导航 ---
+def main():
+    st.sidebar.title("🧭 导航")
+    page = st.sidebar.radio("跳转至", ["单合约深度分析", "日度多合约对比"])
+    
+    if page == "单合约深度分析":
+        render_single_contract_analysis()
+    else:
+        render_daily_comparison()
+
+if __name__ == "__main__":
+    main()

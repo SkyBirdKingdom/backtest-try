@@ -354,6 +354,8 @@ class VirtualExchange:
             pos.last_size_change_time = self.current_time
             # 反手时，重置所有状态
             pos.has_triggered_2nd_add = False
+            pos.has_decreased = False
+            pos.has_fully_2nd_added = False
             pos.has_reversed = False 
             pos.stop_loss_triggered = False
             # 如果这是一个反手策略的成交，标记它已经反手过了
@@ -363,20 +365,6 @@ class VirtualExchange:
             # 【注意】这里清空集合是正确的
             pos.involved_order_ids = set()
 
-        # 2. 【核心修改】检测二次加仓 (Strict Mode 依据)
-        # 逻辑：只有当持仓增加，且当前订单ID之前没记录过（是新订单），才算二次加仓
-        # 排除同一个订单分批成交导致的 size 增加
-        if is_increase and abs(old_size) > 0.001 and not is_reversal:
-            if order.client_order_id not in pos.involved_order_ids:
-                pos.has_triggered_2nd_add = True
-                logger.info(f"[{key}] 触发二次加仓标记 (New Order: {order.client_order_id})")
-        
-        # -------------------------------------------------------------
-        # 🛑 【缺失代码】必须在这里记录当前订单ID，否则上面的检查永远通过
-        # -------------------------------------------------------------
-        pos.involved_order_ids.add(order.client_order_id)
-        # -------------------------------------------------------------
-            
         # 3. 成本计算 (加权平均)
         if (old_size == 0) or (old_size > 0 and size_delta > 0) or (old_size < 0 and size_delta < 0):
             # 加仓 or 建仓
@@ -391,6 +379,7 @@ class VirtualExchange:
             
         elif (old_size > 0 and size_delta < 0) or (old_size < 0 and size_delta > 0):
             # 减仓 or 平仓
+            pos.has_decreased = True
             closed_qty = min(abs(old_size), abs(size_delta))
             raw_pnl = 0.0
             if old_size > 0: 
@@ -407,6 +396,21 @@ class VirtualExchange:
             if is_reversal:
                 pos.avg_price = order.unit_price
                 pos.strategy_name = order.strategy
+        
+        # 2. 【核心修改】检测二次加仓 (Strict Mode 依据)
+        # 逻辑：只有当持仓增加，且当前订单ID之前没记录过（是新订单），才算二次加仓
+        # 排除同一个订单分批成交导致的 size 增加
+        if is_increase and abs(old_size) > 0.001 and not is_reversal:
+            if order.client_order_id not in pos.involved_order_ids:
+                pos.has_triggered_2nd_add = True
+                pos.has_fully_2nd_added = not pos.has_decreased
+                logger.info(f"[{key}] 触发二次加仓标记 (New Order: {order.client_order_id})")
+        
+        # -------------------------------------------------------------
+        # 🛑 【缺失代码】必须在这里记录当前订单ID，否则上面的检查永远通过
+        # -------------------------------------------------------------
+        pos.involved_order_ids.add(order.client_order_id)
+        # -------------------------------------------------------------
         
         pos.timestamp = self.current_time
         if abs(pos.size) < 0.001:
