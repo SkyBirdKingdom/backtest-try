@@ -52,7 +52,7 @@ def main():
         "min_price_for_new_position": 10.0, 
         "max_position_size": 6000.0,
         "max_contract_position_size": 4.0, # 默认值，会被 delivery_rules 覆盖
-        "daily_loss_limit": 100.0,
+        "daily_loss_limit": 5000.0,
         "transaction_cost": 0.23,
 
         # --- 回测仿真参数 ---
@@ -131,7 +131,7 @@ def main():
                         {
                             "start": "00:00",
                             "end": "23:59",
-                            "max_position": 4.0, # 模拟实盘规则
+                            "max_position": 6.0, # 模拟实盘规则
                             "strategy_params": {
                                 "super_mean_reversion_buy": {
                                     "position_ratio": 0.5,
@@ -150,7 +150,7 @@ def main():
     }
 
     # 3. 清空除 trades 表外的所有表
-    clear_tables_except_trades(DB_URL)
+    # clear_tables_except_trades(DB_URL)
     
     # 4. 初始化引擎
     engine = BacktestEngine(config, DB_URL)
@@ -160,8 +160,8 @@ def main():
     # start_date = "2025-04-01"
     # end_date = "2026-01-13"
 
-    start_date = "2025-04-01"
-    end_date = "2026-02-12"
+    start_date = "2026-02-16"
+    end_date = "2026-02-16"
     
     # 可选：只回测特定的合约，填 None 则回测所有
     # contract_filter = ["QH-20260211-24"] 
