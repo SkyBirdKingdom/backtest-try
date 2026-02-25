@@ -261,7 +261,28 @@ class PureStrategyEngine:
         # 取最近10根已完成的K线 (不包含当前正在生成的)
         # bars[-1] 可能是当前分钟未完成的，也可能是刚归档的。
         # 这里逻辑：Engine的bars存的是已归档的。bars[-1]就是最近一根完整的。
-        recent_bars = bars[-10:]
+        # recent_bars = bars[-10:]
+
+        # ==================== 【修复：K线起始时间过滤】 ====================
+        # 确定有效的 K 线起始时间：
+        # 如果触发了二次加仓，从最后一次仓位变动时间开始算
+        # 如果是普通持仓，从初始建仓时间开始算
+        if position.has_triggered_2nd_add and getattr(position, 'second_add_time', None):
+            start_time = position.second_add_time
+        else:
+            start_time = position.initial_entry_time or position.timestamp
+
+        # 过滤出在加仓（或建仓）之后产生的有效 K 线
+        valid_bars = [b for b in bars if b['start_time'] >= start_time]
+
+        # 2. 必须在加仓/建仓后，有足够的历史数据 (至少10根)
+        # 这样可以确保二次加仓后，至少要观察 10 分钟才会触发严格止损
+        if len(valid_bars) < 10:
+            return []
+        
+        # 取加仓后最近的 10 根已完成的有效K线
+        recent_bars = valid_bars[-10:]
+        # =================================================================
 
         # 计算最近10根K线的亏损情况
         # 逻辑：假设每一根K线的收盘价/均价 都是一次潜在的平仓机会，计算当时的亏损率
@@ -957,6 +978,8 @@ class PureStrategyEngine:
         else:
             # condition = tick.price > upper and tick.price > threshold * mean
             condition = tick.price > threshold * mean
+        
+        logger.info(f"时间：{tick.timestamp} 检查极端卖出: {tick.contract_name} 价格={tick.price:.2f}, 均价={mean:.2f}, 上边界={upper:.2f}, 条件={condition}")
             
         if condition:
             # 检查是否启用了动态仓位

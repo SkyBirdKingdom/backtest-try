@@ -115,6 +115,9 @@ class Position:
     # 记录最后一次仓位发生变化（加仓或减仓）的时间，用于重置止盈倒计时
     last_size_change_time: Optional[datetime] = None
 
+    # 【新增】专门记录触发二次加仓的时间，不受减仓影响
+    second_add_time: Optional[datetime] = None
+
     # --- 【新增】实盘逻辑状态字段 ---
     has_triggered_2nd_add: bool = False  # 是否触发过二次加仓 (严格模式止损依据)
     has_reversed: bool = False           # 是否已经执行过反手 (防止反复反手)

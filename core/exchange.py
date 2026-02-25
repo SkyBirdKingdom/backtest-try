@@ -403,6 +403,10 @@ class VirtualExchange:
         if is_increase and abs(old_size) > 0.001 and not is_reversal:
             if order.client_order_id not in pos.involved_order_ids:
                 pos.has_triggered_2nd_add = True
+
+                # 【新增】记录二次加仓的准确时间，如果多次加仓，以最新一次加仓时间为准重新观察
+                pos.second_add_time = self.current_time
+                
                 pos.has_fully_2nd_added = not pos.has_decreased
                 logger.info(f"[{key}] 触发二次加仓标记 (New Order: {order.client_order_id})")
         
