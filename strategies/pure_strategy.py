@@ -108,38 +108,38 @@ class PureStrategyEngine:
         # 收集本 Tick 产生的所有信号
         raw_signals = []
 
-        # --- A. 连续亏损止损策略 & 反手 ---
-        # --- 【新增】反手状态确认逻辑 ---
-        # 如果当前持仓是由反手策略建立的，标记该合约反手已成功执行
-        position = positions.get(tick.contract_name)
-        if position and "trend_reversal" in position.open_strategy:
-             if tick.contract_name not in self.executed_reverse_strategies:
-                 self.executed_reverse_strategies.add(tick.contract_name)
-                 logger.info(f"✅ [{tick.contract_name}] 检测到反手策略持仓，标记为已执行 (不再触发反手)")
-        # -------------------------------
+        # # --- A. 连续亏损止损策略 & 反手 ---
+        # # --- 【新增】反手状态确认逻辑 ---
+        # # 如果当前持仓是由反手策略建立的，标记该合约反手已成功执行
+        # position = positions.get(tick.contract_name)
+        # if position and "trend_reversal" in position.open_strategy:
+        #      if tick.contract_name not in self.executed_reverse_strategies:
+        #          self.executed_reverse_strategies.add(tick.contract_name)
+        #          logger.info(f"✅ [{tick.contract_name}] 检测到反手策略持仓，标记为已执行 (不再触发反手)")
+        # # -------------------------------
 
-        # 2. 【新增】检查挂单 (防止持仓未形成或部分成交时的遗漏)
-        # 只要反手单发生过任何成交 (remaining < quantity)，就视为反手已执行
-        if tick.contract_name not in self.executed_reverse_strategies:
-            for order in active_orders:
-                if order.contract_name == tick.contract_name and "trend_reversal" in order.strategy:
-                    # 如果有成交量 (哪怕是 0.1 MW)，就视为“反手订单发生交易”
-                    if order.remaining_quantity < order.quantity:
-                        self.executed_reverse_strategies.add(tick.contract_name)
-                        logger.info(f"✅ [{tick.contract_name}] 检测到反手订单发生交易 (部分成交)，标记为已执行")
-                        break
+        # # 2. 【新增】检查挂单 (防止持仓未形成或部分成交时的遗漏)
+        # # 只要反手单发生过任何成交 (remaining < quantity)，就视为反手已执行
+        # if tick.contract_name not in self.executed_reverse_strategies:
+        #     for order in active_orders:
+        #         if order.contract_name == tick.contract_name and "trend_reversal" in order.strategy:
+        #             # 如果有成交量 (哪怕是 0.1 MW)，就视为“反手订单发生交易”
+        #             if order.remaining_quantity < order.quantity:
+        #                 self.executed_reverse_strategies.add(tick.contract_name)
+        #                 logger.info(f"✅ [{tick.contract_name}] 检测到反手订单发生交易 (部分成交)，标记为已执行")
+        #                 break
 
         # 控制止损和反手逻辑
-        if position and abs(position.size) > 0.001:
-            sl_signals = self._check_consecutive_loss_stop_loss(tick, position, contract_bars, active_orders)
-            if sl_signals:
-                raw_signals.extend(sl_signals)
+        # if position and abs(position.size) > 0.001:
+        #     sl_signals = self._check_consecutive_loss_stop_loss(tick, position, contract_bars, active_orders)
+        #     if sl_signals:
+        #         raw_signals.extend(sl_signals)
         
-        # --- 【新增】反手后封锁逻辑 ---
-        # 如果该合约已经触发过反手策略，禁止后续一切常规开仓/加仓
-        if tick.contract_name in self.executed_reverse_strategies:
-            # 仅允许上面的止损/平仓逻辑运行，直接跳过下面的 calculate_signals
-            return raw_signals
+        # # --- 【新增】反手后封锁逻辑 ---
+        # # 如果该合约已经触发过反手策略，禁止后续一切常规开仓/加仓
+        # if tick.contract_name in self.executed_reverse_strategies:
+        #     # 仅允许上面的止损/平仓逻辑运行，直接跳过下面的 calculate_signals
+        #     return raw_signals
         # ---------------------------
 
         # --- B. 调用原有的 calculate_signals (常规开仓/加仓逻辑) ---
