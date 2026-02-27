@@ -160,12 +160,12 @@ def main():
     # start_date = "2025-04-01"
     # end_date = "2026-01-13"
 
-    start_date = "2026-02-16"
-    end_date = "2026-02-16"
+    start_date = "2026-02-01"
+    end_date = "2026-02-24"
     
     # 可选：只回测特定的合约，填 None 则回测所有
-    contract_filter = ["PH-20260216-08"] 
-    # contract_filter = None
+    # contract_filter = ["PH-20260216-08"] 
+    contract_filter = None
 
     try:
         engine.run(start_date, end_date, contract_filter)

@@ -55,6 +55,9 @@ class PureStrategyEngine:
         self.bars: Dict[str, List[dict]] = defaultdict(list)
         self.current_bars: Dict[str, dict] = {}
 
+        # --- 【新增】接收引擎层的全局禁开仓标志 ---
+        self.daily_global_block = False
+
     # ----------------------------------------------------------------
     # 【新增】生命周期方法 (Engine 调用接口)
     # ----------------------------------------------------------------
@@ -65,6 +68,9 @@ class PureStrategyEngine:
         self.daily_realized_pnl = 0.0
         self.is_risk_triggered = False
         self.current_date = date_str
+
+        # --- 【新增】跨天重置全局禁开仓标志 ---
+        self.daily_global_block = False
         
         # 清理单日执行标记
         self.delivery_time_strategy_executed.clear()
@@ -420,6 +426,12 @@ class PureStrategyEngine:
         self._update_tick_history(tick)
         self.daily_realized_pnl = current_daily_pnl
         raw_signals = []
+
+        # --- 【新增】全局禁开仓拦截 ---
+        # 如果触发了最后6分钟全局风控，直接返回空列表，不再产生任何开仓/加仓信号
+        if getattr(self, 'daily_global_block', False):
+            return []
+        # ----------------------------
 
         # 0. 基础环境检查
         if abs(tick.price) < self.min_price_for_new_position:
@@ -979,7 +991,7 @@ class PureStrategyEngine:
             # condition = tick.price > upper and tick.price > threshold * mean
             condition = tick.price > threshold * mean
         
-        logger.info(f"时间：{tick.timestamp} 检查极端卖出: {tick.contract_name} 价格={tick.price:.2f}, 均价={mean:.2f}, 上边界={upper:.2f}, 条件={condition}")
+        # logger.info(f"时间：{tick.timestamp} 检查极端卖出: {tick.contract_name} 价格={tick.price:.2f}, 均价={mean:.2f}, 上边界={upper:.2f}, 条件={condition}")
             
         if condition:
             # 检查是否启用了动态仓位

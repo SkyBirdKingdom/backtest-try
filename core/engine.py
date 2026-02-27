@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from core.data_loader import DataLoader
 from core.exchange import VirtualExchange
 from core.bar_generator import BarGenerator
-from core.models import TickEvent
+from core.models import TickEvent, SettlementEvent
 from core.recorder import BacktestRecorder
 
 from strategies.pure_strategy import PureStrategyEngine
@@ -46,6 +46,9 @@ class BacktestEngine:
         
         self.reject_counter = 0 
 
+        # --- 【新增】单日全局禁开仓标志 ---
+        self.daily_trading_blocked = False
+
     def run(self, start_date: str, end_date: str, contract_filter: List[str] = None):
         logger.info(f"=== 启动回测 (按交付日排序): {start_date} 至 {end_date} ===")
         
@@ -73,11 +76,63 @@ class BacktestEngine:
                 self.current_delivery_date = tick_delivery_date
                 # 重置交付日累计盈亏
                 self.current_delivery_pnl = 0.0
+
+                # --- 【新增】跨天重置全局禁开仓标志 ---
+                self.daily_trading_blocked = False
+                if hasattr(self.strategy, 'daily_global_block'):
+                    self.strategy.daily_global_block = False
+                # -----------------------------------
+
                 # 通知策略跨日
                 if hasattr(self.strategy, 'on_new_day'):
                     self.strategy.on_new_day(str(tick_delivery_date))
                 
                 logger.info(f"📅 进入新交付日: {tick_delivery_date} (日内盈亏重置, 过期持仓清理)")
+            
+            # --- 【新增】PH合约最后6分钟全局阻断逻辑 ---
+            if not self.daily_trading_blocked and tick.contract_name.startswith("PH"):
+                # 【关键修复】只有当我们当前持有该 PH 合约的仓位时，才进行时间判断
+                pos = self.exchange.positions.get(tick.contract_name)
+                if pos and abs(pos.size) > 0.001:
+                    if tick.delivery_start:
+                        gate_closure = tick.delivery_start - timedelta(hours=1)
+                        minutes_to_close = (gate_closure - tick.timestamp).total_seconds() / 60.0
+                        
+                        # 匹配最后 6 分钟阶段
+                        if 0 < minutes_to_close <= 6.0:
+                            self.daily_trading_blocked = True
+                            if hasattr(self.strategy, 'daily_global_block'):
+                                self.strategy.daily_global_block = True
+                            
+                            logger.warning(f"🛑 [全局风控] 持仓中的 PH 合约 {tick.contract_name} 进入最后6分钟 ({minutes_to_close:.1f}m)！")
+                            logger.warning(f"🚫 触发单日全局禁开仓：阻止后续所有新信号，并撤销现有未成交开仓单。")
+
+                            # --- 【新增】将触发记录保存到数据库中 ---
+                            block_event = SettlementEvent(
+                                timestamp=tick.timestamp,
+                                contract_name=tick.contract_name,
+                                contract_id=tick.contract_id,
+                                size=pos.size,
+                                avg_price=pos.avg_price,
+                                reason="GLOBAL_BLOCK_6MIN" # 使用特定的 reason 标记
+                            )
+                            self.recorder.record_settlement(block_event)
+                            # ----------------------------------------
+                            
+                            # 撤销所有未成交的开仓订单 (保留自动止盈、止损、强平单)
+                            orders_to_cancel = []
+                            for order in self.exchange.active_orders:
+                                is_exit_strategy = (order.strategy.startswith("auto_profit") or 
+                                                    order.strategy.startswith("force_close") or
+                                                    order.strategy.startswith("stop_loss") or 
+                                                    order.strategy.startswith("exit_"))
+                                if not is_exit_strategy:
+                                    orders_to_cancel.append(order.client_order_id)
+                                    
+                            for oid in orders_to_cancel:
+                                self.exchange.cancel_order(oid)
+                                logger.info(f"🧹 [全局风控] 已撤销残留开仓单: {oid}")
+            # ----------------------------------------------------
 
             if tick_count % 50000 == 0:
                 logger.info(f"进度: {tick.timestamp} | 交付日: {tick_delivery_date} | 当日PnL: {self.current_delivery_pnl:.2f}")
