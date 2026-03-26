@@ -50,9 +50,9 @@ def main():
     config = {
         "initial_capital": 40000.0,
         "min_price_for_new_position": 10.0, 
-        "max_position_size": 6000.0,
-        "max_contract_position_size": 4.0, # 默认值，会被 delivery_rules 覆盖
-        "daily_loss_limit": 5000.0,
+        "max_position_size": 100.0,
+        "max_contract_position_size": 6.0, # 默认值，会被 delivery_rules 覆盖
+        "daily_loss_limit": 500.0,
         "transaction_cost": 0.23,
 
         # --- 回测仿真参数 ---
@@ -75,13 +75,6 @@ def main():
                 "liquidity_participation": 0.20, # 吃掉预测量的 5%
                 "liquidity_projection": "60",      # 2. 预测未来1小时总成交 (或填 "till_close")
                 "action": "BUY",
-                # "history_min_len": 10,
-                # "ma_window": 5,
-                # "std_ratio_threshold": 0.1,
-                # "threshold": 2,
-                # "position_ratio": 0.2,
-                # "position_split": 3,
-                # "min_open_size": 0.1
                 "history_min_len": 10,
                 "percentile_window": 5,
                 "percentile_low": 5,
@@ -157,11 +150,8 @@ def main():
 
     # 4. 运行回测
     # 请确保日期范围内你的数据库有数据
-    # start_date = "2025-04-01"
-    # end_date = "2026-01-13"
-
     start_date = "2026-02-01"
-    end_date = "2026-02-24"
+    end_date = "2026-02-28"
     
     # 可选：只回测特定的合约，填 None 则回测所有
     # contract_filter = ["PH-20260216-08"] 

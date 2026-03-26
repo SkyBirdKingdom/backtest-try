@@ -158,15 +158,121 @@ def render_daily_comparison():
         with st.expander("查看原始统计数据"):
             st.dataframe(df_daily, use_container_width=True)
 
+# --- 页面三：月度盈亏统计 (修改版) ---
+def render_monthly_statistics():
+    st.title("🗓️ 月度盈亏统计分析")
+    
+    all_runs = get_all_run_ids()
+    selected_run = st.selectbox("选择回测批次 (Run ID) 以进行月度统计", all_runs)
+    
+    if not selected_run:
+        return
+
+    # 从 backtest_trades 中获取该 run_id 的所有数据
+    query = f"""
+        SELECT contract_name, pnl, action, size 
+        FROM backtest_trades 
+        WHERE run_id = '{selected_run}'
+    """
+    df = pd.read_sql(query, get_engine())
+
+    if df.empty:
+        st.warning("该 Run ID 没有相关的交易数据。")
+        return
+
+    # 1. 使用正则从 contract_name 中提取 YYYYMMDD 日期 (支持 PH-YYYYMMDD-xx 和 QH-YYYYMMDD-xx)
+    df['date_str'] = df['contract_name'].str.extract(r'-(\d{8})-')
+    
+    # 2. 转换为时间格式，并提取出 YYYY-MM 月份标识
+    df['month'] = pd.to_datetime(df['date_str'], format='%Y%m%d', errors='coerce').dt.strftime('%Y-%m')
+    df = df.dropna(subset=['month'])
+    
+    if df.empty:
+        st.error("未能从合约名称中成功解析出日期，请检查 contract_name 的命名格式。")
+        return
+
+    # 3. 基础按月聚合统计（包含所有订单记录）
+    monthly_stats = df.groupby('month').agg(
+        total_pnl=('pnl', 'sum'),
+        total_executions=('pnl', 'count'), # 总成交动作（含开仓+平仓）
+        unique_contracts=('contract_name', 'nunique')
+    ).reset_index()
+
+    # 4. 提取有效平仓单（pnl 绝对值大于0的才算作平仓结算）
+    # 这样可以过滤掉所有建仓时 pnl=0 的占位记录，分母才准确
+    close_trades_df = df[df['pnl'].abs() > 0.0001]
+    close_stats = close_trades_df.groupby('month').agg(
+        close_trades=('pnl', 'count')
+    ).reset_index()
+
+    # 5. 提取盈利单（pnl > 0）
+    win_trades_df = df[df['pnl'] > 0]
+    win_stats = win_trades_df.groupby('month').agg(
+        win_trades=('pnl', 'count')
+    ).reset_index()
+
+    # 6. 数据合并
+    monthly_stats = pd.merge(monthly_stats, close_stats, on='month', how='left').fillna(0)
+    monthly_stats = pd.merge(monthly_stats, win_stats, on='month', how='left').fillna(0)
+
+    # 7. 修正胜率计算逻辑：用 盈利单 / 有效平仓单
+    monthly_stats['win_rate'] = (monthly_stats['win_trades'] / monthly_stats['close_trades'].replace(0, 1) * 100).round(2)
+
+    # 按照月份排序
+    monthly_stats = monthly_stats.sort_values('month')
+
+    # --- 界面展示 ---
+    st.subheader("📊 月度总盈亏走势")
+    # 绘制柱状图，盈利为绿色，亏损为红色
+    colors = ['#00CC96' if pnl >= 0 else '#EF553B' for pnl in monthly_stats['total_pnl']]
+    
+    fig = go.Figure(data=[
+        go.Bar(
+            name='月度盈亏', 
+            x=monthly_stats['month'], 
+            y=monthly_stats['total_pnl'],
+            marker_color=colors,
+            text=monthly_stats['total_pnl'].round(2),
+            textposition='auto'
+        )
+    ])
+    fig.update_layout(
+        xaxis_title="月份",
+        yaxis_title="净盈亏 (EUR)",
+        template="plotly_white",
+        height=500
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📋 月度统计数据明细")
+    # 重命名列并格式化展示 (特意把 总成交动作 和 实际平仓笔数 都显示出来方便你核对)
+    display_df = monthly_stats[['month', 'total_pnl', 'total_executions', 'close_trades', 'unique_contracts', 'win_rate']].copy()
+    display_df.columns = ['月份', '总盈亏 (EUR)', '总成交动作(含开平仓)', '有效平仓笔数', '参与合约数量', '平仓胜率 (%)']
+    
+    # 设置背景色渐变方便查看
+    st.dataframe(
+        display_df.style.background_gradient(cmap='RdYlGn', subset=['总盈亏 (EUR)'])
+                        .format({
+                            '总盈亏 (EUR)': "{:.2f}", 
+                            '平仓胜率 (%)': "{:.2f}%",
+                            '总成交动作(含开平仓)': "{:.0f}",
+                            '有效平仓笔数': "{:.0f}",
+                            '参与合约数量': "{:.0f}"
+                        }), 
+        use_container_width=True
+    )
+
 # --- 主导航 ---
 def main():
     st.sidebar.title("🧭 导航")
-    page = st.sidebar.radio("跳转至", ["单合约深度分析", "日度多合约对比"])
+    page = st.sidebar.radio("跳转至", ["单合约深度分析", "日度多合约对比", "月度盈亏统计"])
     
     if page == "单合约深度分析":
         render_single_contract_analysis()
-    else:
+    elif page == "日度多合约对比":
         render_daily_comparison()
+    else:
+        render_monthly_statistics()
 
 if __name__ == "__main__":
     main()

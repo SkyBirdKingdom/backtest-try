@@ -574,7 +574,10 @@ class PureStrategyEngine:
             if is_close_logic:
                 return True
             original_size = signal.size
-            signal.size = round(signal.size / 4, 1)  # 四舍五入到小数点后一位
+            # 将数量除以6后截断到小数点后一位（向零截断，不四舍五入）
+            divided = original_size / 6.0
+            truncated = math.trunc(divided * 10) / 10.0
+            signal.size = truncated
             if signal.size < 0.1:
                 msg = f"信号验证失败 - PH信号调整后仓位过小: 合约={signal.contract_name}, 策略={signal.strategy_name}, 动作={signal.action.value}, 原始数量={original_size}, 调整后数量={signal.size}, 价格={signal.price}, trade_id={getattr(signal, 'trade_id', '')}, trade_time={getattr(signal, 'trade_time', '')}"
                 logger.warning(msg)
@@ -933,6 +936,9 @@ class PureStrategyEngine:
         
         lower = np.percentile(prices, percentile)
         mean = np.mean(prices)
+
+        if abs(mean) < 50:
+            threshold = 1.5
         
         condition = False
         if mean < 0:
@@ -979,6 +985,9 @@ class PureStrategyEngine:
         
         upper = np.percentile(prices, percentile)
         mean = np.mean(prices)
+
+        if abs(mean) < 50:
+            threshold = 1.5
         
         condition = False
         if mean < 0:

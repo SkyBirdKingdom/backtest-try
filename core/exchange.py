@@ -341,10 +341,10 @@ class VirtualExchange:
         new_size = round(old_size + size_delta, 1) 
 
         # --- 【新增】检测仓位变化，更新最后变动时间 ---
-        if abs(new_size - old_size) > 0.001:
-            pos.last_size_change_time = self.current_time
+        # if abs(new_size - old_size) > 0.001:
+        #     pos.last_size_change_time = self.current_time
         # ----------------------------------------
-        
+
         is_increase = abs(new_size) > abs(old_size)
         is_reversal = (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0)
         
@@ -387,8 +387,10 @@ class VirtualExchange:
             else: 
                 raw_pnl = (pos.avg_price - price) * closed_qty
             
-            if is_qh: realized_pnl = raw_pnl / 4.0
-            else: realized_pnl = raw_pnl
+            if is_qh: 
+                realized_pnl = raw_pnl / 4.0
+            else: 
+                realized_pnl = raw_pnl
             
             self.capital += realized_pnl
             pos.size = new_size
